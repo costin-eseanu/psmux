@@ -381,13 +381,7 @@ fn run_main() -> io::Result<()> {
                     .or_else(resolve_default_session_name)
                     .or_else(resolve_last_session_name)
                     .unwrap_or_else(|| "0".to_string());
-                // Apply -L namespace prefix so the port file lookup succeeds
-                let namespaced = if let Some(ref l) = l_socket_name {
-                    format!("{}__{}", l, name)
-                } else {
-                    name
-                };
-                env::set_var("PSMUX_SESSION_NAME", namespaced);
+                env::set_var("PSMUX_SESSION_NAME", name);
                 env::set_var("PSMUX_REMOTE_ATTACH", "1");
             }
             "server" => {
