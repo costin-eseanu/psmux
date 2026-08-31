@@ -20,7 +20,7 @@ if (-not (Test-Path $PSMUX)) {
     exit 1
 }
 
-function Psmux { & $PSMUX @args 2>&1; Start-Sleep -Milliseconds 300 }
+function Psmux { & $PSMUX @args 2>&1; Start-Sleep -Milliseconds 100 }
 
 $SESSION = "nav_test_$(Get-Random)"
 Write-Info "Using psmux binary: $PSMUX"
@@ -59,7 +59,7 @@ function Get-AllPaneIds {
 function Navigate {
     param($Session, $Dir)
     Psmux select-pane -t $Session "-$Dir" | Out-Null
-    Start-Sleep -Milliseconds 200
+    Start-Sleep -Milliseconds 50
 }
 
 # Check if all panes are reachable by cycling through directions
@@ -83,9 +83,13 @@ function Test-AllPanesReachable {
     
     while ($queue.Count -gt 0) {
         $current = $queue.Dequeue()
-        # Select this pane by ID (include session name for correct routing)
-        Psmux select-pane -t "${Session}:${current}" | Out-Null
-        Start-Sleep -Milliseconds 200
+        # Select this pane by ID. The id belongs in the PANE slot after the dot:
+        # "session:%id" puts it in the WINDOW slot, which real tmux rejects too
+        # ("can't find window: %1"). Written that way the BFS could never return
+        # to its current pane, so directions were probed from whatever pane
+        # happened to be active and panes looked unreachable.
+        Psmux select-pane -t "${Session}:.${current}" | Out-Null
+        Start-Sleep -Milliseconds 50
         foreach ($dir in @("U", "D", "L", "R")) {
             # Navigate in direction
             Navigate -Session $Session -Dir $dir
@@ -96,8 +100,8 @@ function Test-AllPanesReachable {
                 Write-Info "    From $current DIR=$dir -> discovered $newId"
             }
             # Return to current pane for next direction
-            Psmux select-pane -t "${Session}:${current}" | Out-Null
-            Start-Sleep -Milliseconds 200
+            Psmux select-pane -t "${Session}:.${current}" | Out-Null
+            Start-Sleep -Milliseconds 50
         }
     }
     
@@ -116,14 +120,14 @@ function Test-AllPanesReachable {
 }
 
 # ═══════════════════════════════════════════════════════════════
-Write-Host "=" * 60
+Write-Host ("=" * 60)
 Write-Host "PANE NAVIGATION TESTS"
-Write-Host "=" * 60
+Write-Host ("=" * 60)
 
 # ─── Start session ────────────────────────────────────────────
 Write-Info "Starting test session: $SESSION"
 Start-Process -FilePath $PSMUX -ArgumentList "new-session", "-d", "-s", $SESSION -WindowStyle Hidden | Out-Null
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 2
 
 $sessions = (& $PSMUX ls 2>&1) -join "`n"
 if ($sessions -notmatch [regex]::Escape($SESSION)) {
@@ -137,7 +141,7 @@ Write-Host ""
 Write-Host "--- Layout 1: 2 panes (vertical split) ---"
 # Already have 1 pane, split once
 Psmux split-window -v -t $SESSION | Out-Null
-Start-Sleep -Seconds 2
+Start-Sleep -Milliseconds 1000
 
 Write-Test "2-pane vertical: all panes reachable"
 Test-AllPanesReachable -Session $SESSION -Label "2-pane vertical" -PaneCount 2
@@ -146,7 +150,7 @@ Test-AllPanesReachable -Session $SESSION -Label "2-pane vertical" -PaneCount 2
 Write-Host ""
 Write-Host "--- Layout 2: 3 panes (V + H) ---"
 Psmux split-window -h -t $SESSION | Out-Null
-Start-Sleep -Seconds 2
+Start-Sleep -Milliseconds 1000
 
 Write-Test "3-pane V+H: all panes reachable"
 Test-AllPanesReachable -Session $SESSION -Label "3-pane V+H" -PaneCount 3
@@ -158,7 +162,7 @@ Write-Host "--- Layout 3: 4 panes (asymmetric grid) ---"
 Psmux select-pane -t $SESSION -U | Out-Null
 Start-Sleep -Milliseconds 500
 Psmux split-window -h -t $SESSION | Out-Null
-Start-Sleep -Seconds 2
+Start-Sleep -Milliseconds 1000
 
 Write-Test "4-pane asymmetric: all panes reachable"
 Test-AllPanesReachable -Session $SESSION -Label "4-pane asymmetric" -PaneCount 4
@@ -167,7 +171,7 @@ Test-AllPanesReachable -Session $SESSION -Label "4-pane asymmetric" -PaneCount 4
 Write-Host ""
 Write-Host "--- Layout 4: 5 panes ---"
 Psmux split-window -v -t $SESSION | Out-Null
-Start-Sleep -Seconds 2
+Start-Sleep -Milliseconds 1000
 
 Write-Test "5-pane: all panes reachable"
 Test-AllPanesReachable -Session $SESSION -Label "5-pane" -PaneCount 5
@@ -176,7 +180,7 @@ Test-AllPanesReachable -Session $SESSION -Label "5-pane" -PaneCount 5
 Write-Host ""
 Write-Host "--- Layout 5: 6 panes (complex) ---"
 Psmux split-window -h -t $SESSION | Out-Null
-Start-Sleep -Seconds 2
+Start-Sleep -Milliseconds 1000
 
 Write-Test "6-pane complex: all panes reachable"
 Test-AllPanesReachable -Session $SESSION -Label "6-pane complex" -PaneCount 6
@@ -185,7 +189,7 @@ Test-AllPanesReachable -Session $SESSION -Label "6-pane complex" -PaneCount 6
 Write-Host ""
 Write-Host "--- Layout 6: New window, 2x2 grid ---"
 Psmux new-window -t $SESSION | Out-Null
-Start-Sleep -Seconds 2
+Start-Sleep -Milliseconds 1000
 # Create a 2x2 grid: split v, go up, split h, go down, split h
 Psmux split-window -v -t $SESSION | Out-Null
 Start-Sleep -Seconds 1
@@ -196,7 +200,7 @@ Start-Sleep -Seconds 1
 Psmux select-pane -t $SESSION -D | Out-Null
 Start-Sleep -Milliseconds 300
 Psmux split-window -h -t $SESSION | Out-Null
-Start-Sleep -Seconds 2
+Start-Sleep -Milliseconds 1000
 
 Write-Test "2x2 grid: all panes reachable"
 Test-AllPanesReachable -Session $SESSION -Label "2x2 grid" -PaneCount 4
@@ -265,16 +269,79 @@ if ($replayTopRight -eq $topRight -and $replayDown -eq $bottomRight) {
     Write-Fail "Down from top-right went to $replayDown, expected $bottomRight (circuit result)"
 }
 
+# ═══════════════════════════════════════════════════════════════
+# Win32 TUI VERIFICATION: Prove pane navigation via real keystrokes
+# ═══════════════════════════════════════════════════════════════
+Write-Host ""
+Write-Host ("=" * 60)
+Write-Host "Win32 TUI VISUAL VERIFICATION" -ForegroundColor Yellow
+Write-Host ("=" * 60)
+
+. "$PSScriptRoot\tui_helper.ps1"
+$TUI_SESSION_NAV = "nav_tui_proof"
+
+$tuiOk = Launch-PsmuxWindow -Session $TUI_SESSION_NAV
+if ($tuiOk) {
+    Start-Sleep -Milliseconds 1000
+
+    # Create a 2-pane layout for navigation testing
+    & $script:TUI_PSMUX split-window -h -t $TUI_SESSION_NAV 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 500
+
+    # TUI Test 1: Navigate left via CLI (visible TUI window proves rendering)
+    Write-Test "TUI: Navigate left via select-pane -L (visible TUI proof)"
+    $paneBefore = Safe-TuiQuery "#{pane_index}" -Session $TUI_SESSION_NAV
+    & $script:TUI_PSMUX select-pane -L -t $TUI_SESSION_NAV 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 300
+    $paneAfter = Safe-TuiQuery "#{pane_index}" -Session $TUI_SESSION_NAV
+    if ($paneAfter -ne $paneBefore) {
+        Write-Pass "TUI: select-pane -L moved focus ($paneBefore -> $paneAfter)"
+    } else {
+        Write-Fail "TUI: select-pane -L did not move focus (stayed at $paneBefore)"
+    }
+
+    # TUI Test 2: Navigate right via CLI
+    Write-Test "TUI: Navigate right via select-pane -R (visible TUI proof)"
+    $paneBefore2 = Safe-TuiQuery "#{pane_index}" -Session $TUI_SESSION_NAV
+    & $script:TUI_PSMUX select-pane -R -t $TUI_SESSION_NAV 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 300
+    $paneAfter2 = Safe-TuiQuery "#{pane_index}" -Session $TUI_SESSION_NAV
+    if ($paneAfter2 -ne $paneBefore2) {
+        Write-Pass "TUI: select-pane -R moved focus ($paneBefore2 -> $paneAfter2)"
+    } else {
+        Write-Fail "TUI: select-pane -R did not move focus (stayed at $paneBefore2)"
+    }
+
+    # TUI Test 3: Create vertical split and navigate up
+    Write-Test "TUI: Navigate up via select-pane -U (visible TUI proof)"
+    & $script:TUI_PSMUX split-window -v -t $TUI_SESSION_NAV 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 500
+    $paneBefore3 = Safe-TuiQuery "#{pane_index}" -Session $TUI_SESSION_NAV
+    & $script:TUI_PSMUX select-pane -U -t $TUI_SESSION_NAV 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 300
+    $paneAfter3 = Safe-TuiQuery "#{pane_index}" -Session $TUI_SESSION_NAV
+    if ($paneAfter3 -ne $paneBefore3) {
+        Write-Pass "TUI: select-pane -U moved focus ($paneBefore3 -> $paneAfter3)"
+    } else {
+        Write-Fail "TUI: select-pane -U did not move focus (stayed at $paneBefore3)"
+    }
+
+    Cleanup-PsmuxWindow -Session $TUI_SESSION_NAV
+    Write-Host ""
+} else {
+    Write-Info "TUI verification skipped (could not launch window)"
+}
+
 # ─── Cleanup ──────────────────────────────────────────────────
 Write-Host ""
 Write-Info "Cleaning up..."
 Psmux kill-session -t $SESSION | Out-Null
-Start-Sleep -Seconds 2
+Start-Sleep -Milliseconds 1000
 
 Write-Host ""
-Write-Host "=" * 60
+Write-Host ("=" * 60)
 Write-Host "PANE NAVIGATION TEST SUMMARY"
-Write-Host "=" * 60
+Write-Host ("=" * 60)
 Write-Host "Passed: $script:TestsPassed" -ForegroundColor Green
 Write-Host "Failed: $script:TestsFailed" -ForegroundColor Red
 Write-Host ""

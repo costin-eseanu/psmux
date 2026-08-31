@@ -4,18 +4,35 @@
 // bloat existing source files.
 // ─────────────────────────────────────────────────────────────────────
 
+/// Default root-table keybindings (no prefix required).
+/// These match tmux defaults for the root key table.
+/// tmux binds NO keys in the root table by default (mouse aside) — in
+/// particular PPage/PageUp is bound only in the PREFIX table, so a bare
+/// PageUp must reach the running application (pagers, editors) untouched
+/// (issue #488). Users can restore the old behavior with
+/// `bind-key -n PageUp copy-mode -u`.
+pub const ROOT_DEFAULTS: &[(&str, &str)] = &[];
+
 /// Default prefix-table keybindings.
 /// Each entry is `(key_string, command_string)`.
 /// The overlay and `list-keys` both use this as the canonical source
 /// of truth, so there is exactly *one* place to update.
 pub const PREFIX_DEFAULTS: &[(&str, &str)] = &[
+    // ── Send prefix (tmux: bind C-b send-prefix) ──
+    // Pressing the prefix key twice forwards a literal prefix keystroke to the
+    // active pane, which lets shells like nushell/bash interpret C-a as
+    // "go to start of line" even when C-a is the psmux prefix.  When the user
+    // changes the prefix via `set -g prefix <key>`, the new key is also bound
+    // to send-prefix automatically (see config::ensure_prefix_self_binding).
+    ("C-b",     "send-prefix"),
+
     // ── Window management ──
     ("c",       "new-window"),
     ("n",       "next-window"),
     ("p",       "previous-window"),
     ("l",       "last-window"),
     ("w",       "choose-tree"),
-    ("&",       "kill-window"),
+    ("&",       "confirm-before -p 'kill-window #W? (y/n)' kill-window"),
     (",",       "rename-window"),
     ("'",       "select-window-index"),
     ("0",       "select-window -t :0"),
@@ -43,7 +60,7 @@ pub const PREFIX_DEFAULTS: &[(&str, &str)] = &[
     ("q",       "display-panes"),
 
     // ── Pane management ──
-    ("x",       "kill-pane"),
+    ("x",       "confirm-before -p 'kill-pane #P? (y/n)' kill-pane"),
     ("z",       "resize-pane -Z"),
     ("{",       "swap-pane -U"),
     ("}",       "swap-pane -D"),
@@ -75,8 +92,12 @@ pub const PREFIX_DEFAULTS: &[(&str, &str)] = &[
 
     // ── Copy / Paste ──
     ("[",       "copy-mode"),
+    // tmux: bind PPage { copy-mode -u } — enter copy mode scrolled up one
+    // page. The root table deliberately has no PageUp binding (issue #488).
+    ("PageUp",  "copy-mode -u"),
     ("]",       "paste-buffer"),
     ("=",       "choose-buffer"),
+    ("#",       "list-buffers"),
 
     // ── Misc ──
     (":",       "command-prompt"),
@@ -84,6 +105,10 @@ pub const PREFIX_DEFAULTS: &[(&str, &str)] = &[
     ("i",       "display-message"),
     ("t",       "clock-mode"),
     ("s",       "choose-session"),
+    ("(",       "switch-client -p"),
+    (")",       "switch-client -n"),
+    ("v",       "rectangle-toggle"),
+    ("y",       "copy-yank"),
 ];
 
 // ─────────────────────────────────────────────────────────────────────
@@ -148,10 +173,17 @@ const COPY_MODE_VI: &[(&str, &str)] = &[
     ("F{char}",   "jump-backward"),
     ("t{char}",   "jump-to-forward"),
     ("T{char}",   "jump-to-backward"),
+    (";",         "jump-again"),
+    (",",         "jump-reverse"),
+    // Mark
+    ("X",         "set-mark"),
+    ("M-x",       "jump-to-mark"),
+    ("r",         "refresh-from-pane"),
     // Bracket / paragraph
     ("%",         "next-matching-bracket"),
     ("{",         "previous-paragraph"),
     ("}",         "next-paragraph"),
+    ("z",         "scroll-middle"),
     // Selection
     ("v",         "rectangle-toggle"),
     ("V",         "select-line"),
@@ -362,6 +394,7 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     ("synchronize-panes",          "off"),
     ("set-titles",                 "off"),
     ("allow-passthrough",          "off"),
+    ("priority",                   "above-normal"),
     ("default-command",            "(system shell)"),
     ("word-separators",            "\" -_@\""),
     // Display timing
@@ -391,6 +424,7 @@ const OPTIONS_REF: &[(&str, &str)] = &[
     // Pane borders
     ("pane-border-style",          "\"\""),
     ("pane-active-border-style",   "fg=green"),
+    ("pane-border-hover-style",     "fg=yellow"),
     // Messages / Modes
     ("message-style",              "bg=yellow,fg=black"),
     ("message-command-style",      "bg=black,fg=yellow"),
@@ -482,29 +516,32 @@ pub fn mouse_lines() -> Vec<String> {
 /// binding in the prefix table are automatically excluded.
 pub fn build_overlay_lines(
     user_bindings: &[(bool, String, String, String)],
+    _defaults_suppressed: bool,
 ) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
 
-    // Collect user-overridden keys for prefix table
-    let overridden: std::collections::HashSet<&str> = user_bindings
-        .iter()
-        .filter(|(_, t, _, _)| t == "prefix")
-        .map(|(_, _, k, _)| k.as_str())
-        .collect();
+    // Since defaults are now populated in key_tables and synced as bindings,
+    // all prefix bindings (defaults + user) come through user_bindings.
+    // No need to separately iterate PREFIX_DEFAULTS.
 
-    // ── 1. Prefix defaults (excluding overridden) ──
+    // ── 1. Prefix bindings ──
     lines.push("── prefix table (C-b + key) ───────────────────────────────".into());
-    for (k, cmd) in PREFIX_DEFAULTS {
-        if !overridden.contains(k) {
-            lines.push(format!("bind-key -T prefix {} {}", k, cmd));
-        }
+    let prefix_bindings: Vec<_> = user_bindings.iter()
+        .filter(|(_, t, _, _)| t == "prefix")
+        .collect();
+    for (repeat, table, key, cmd) in &prefix_bindings {
+        let r = if *repeat { " -r" } else { "" };
+        lines.push(format!("bind-key{} -T {} {} {}", r, table, key, cmd));
     }
 
-    // ── 2. User bindings (all tables) ──
-    if !user_bindings.is_empty() {
+    // ── 2. Non-prefix user bindings ──
+    let non_prefix: Vec<_> = user_bindings.iter()
+        .filter(|(_, t, _, _)| t != "prefix")
+        .collect();
+    if !non_prefix.is_empty() {
         lines.push(String::new());
-        lines.push("── user / config bindings ─────────────────────────────────".into());
-        for (repeat, table, key, cmd) in user_bindings {
+        lines.push("── other table bindings ───────────────────────────────────".into());
+        for (repeat, table, key, cmd) in &non_prefix {
             let r = if *repeat { " -r" } else { "" };
             lines.push(format!("bind-key{} -T {} {} {}", r, table, key, cmd));
         }
@@ -526,28 +563,18 @@ pub fn build_overlay_lines(
 /// Build the output for the CLI `list-keys` command (server-side).
 ///
 /// `user_tables` — iterator of `(table_name, key_str, action_str, repeat)`.
+/// `defaults_suppressed` — when true, skip PREFIX_DEFAULTS (set by unbind-key -a).
 pub fn build_list_keys_output<'a>(
     user_tables: impl Iterator<Item = (&'a str, String, String, bool)>,
+    _defaults_suppressed: bool,
 ) -> String {
     let mut output = String::new();
-    let mut overridden: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Peek at prefix-table user bindings first to know what's overridden
+    // Since defaults are now populated in key_tables (via populate_default_bindings),
+    // all bindings (defaults + user overrides) come through user_tables.
+    // No need to separately prepend PREFIX_DEFAULTS.
     let user_entries: Vec<(&str, String, String, bool)> = user_tables.collect();
-    for (table, key, _, _) in &user_entries {
-        if *table == "prefix" {
-            overridden.insert(key.clone());
-        }
-    }
 
-    // Defaults
-    for (k, cmd) in PREFIX_DEFAULTS {
-        if !overridden.contains(*k) {
-            output.push_str(&format!("bind-key -T prefix {} {}\n", k, cmd));
-        }
-    }
-
-    // User bindings
     for (table, key, action, repeat) in &user_entries {
         let r = if *repeat { " -r" } else { "" };
         output.push_str(&format!("bind-key{} -T {} {} {}\n", r, table, key, action));

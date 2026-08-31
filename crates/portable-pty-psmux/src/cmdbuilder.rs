@@ -138,56 +138,51 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
         if let Ok(sys_env) = RegKey::predef(HKEY_LOCAL_MACHINE)
             .open_subkey("System\\CurrentControlSet\\Control\\Session Manager\\Environment")
         {
-            for res in sys_env.enum_values() {
-                if let Ok((name, value)) = res {
-                    if name.to_ascii_lowercase() == "username" {
-                        continue;
-                    }
-                    if let Ok(value) = reg_value_to_string(&value) {
-                        log::trace!("adding SYS env: {:?} {:?}", name, value);
-                        env.insert(
-                            EnvEntry::map_key(name.clone().into()),
-                            EnvEntry {
-                                is_from_base_env: true,
-                                preferred_key: name.into(),
-                                value,
-                            },
-                        );
-                    }
+            for (name, value) in sys_env.enum_values().flatten() {
+                if name.eq_ignore_ascii_case("username") {
+                    continue;
+                }
+                if let Ok(value) = reg_value_to_string(&value) {
+                    log::trace!("adding SYS env: {:?} {:?}", name, value);
+                    env.insert(
+                        EnvEntry::map_key(name.clone().into()),
+                        EnvEntry {
+                            is_from_base_env: true,
+                            preferred_key: name.into(),
+                            value,
+                        },
+                    );
                 }
             }
         }
 
         if let Ok(sys_env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Environment") {
-            for res in sys_env.enum_values() {
-                if let Ok((name, value)) = res {
-                    if let Ok(value) = reg_value_to_string(&value) {
-                        // Merge the system and user paths together
-                        let value = if name.to_ascii_lowercase() == "path" {
-                            match env.get(&EnvEntry::map_key(name.clone().into())) {
-                                Some(entry) => {
-                                    let mut result = OsString::new();
-                                    result.push(&entry.value);
-                                    result.push(";");
-                                    result.push(&value);
-                                    result
-                                }
-                                None => value,
+            for (name, value) in sys_env.enum_values().flatten() {
+                if let Ok(value) = reg_value_to_string(&value) {
+                    // Merge the system and user paths together
+                    let value = if name.eq_ignore_ascii_case("path") {
+                        match env.get(&EnvEntry::map_key(name.clone().into())) {
+                            Some(entry) => {
+                                let mut result = OsString::new();
+                                result.push(&entry.value);
+                                result.push(";");
+                                result.push(&value);
+                                result
                             }
-                        } else {
-                            value
-                        };
-
-                        log::trace!("adding USER env: {:?} {:?}", name, value);
-                        env.insert(
-                            EnvEntry::map_key(name.clone().into()),
-                            EnvEntry {
-                                is_from_base_env: true,
-                                preferred_key: name.into(),
-                                value,
-                            },
-                        );
-                    }
+                            None => value,
+                        }
+                    } else {
+                        value
+                    };
+                    log::trace!("adding USER env: {:?} {:?}", name, value);
+                    env.insert(
+                        EnvEntry::map_key(name.clone().into()),
+                        EnvEntry {
+                            is_from_base_env: true,
+                            preferred_key: name.into(),
+                            value,
+                        },
+                    );
                 }
             }
         }
@@ -308,7 +303,7 @@ impl CommandBuilder {
             EnvEntry {
                 is_from_base_env: false,
                 preferred_key: key,
-                value: value,
+                value,
             },
         );
     }
@@ -583,7 +578,7 @@ impl CommandBuilder {
             let extensions = self.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
             for path in std::env::split_paths(&path) {
                 // Check for exactly the user's string in this path dir
-                let candidate = path.join(&exe);
+                let candidate = path.join(exe);
                 if candidate.exists() {
                     return candidate.into_os_string();
                 }
@@ -595,7 +590,7 @@ impl CommandBuilder {
                     // PATHEXT includes the leading `.`, but `with_extension`
                     // doesn't want that
                     let ext = ext.to_str().expect("PATHEXT entries must be utf8");
-                    let path = path.join(&exe).with_extension(&ext[1..]);
+                    let path = path.join(exe).with_extension(&ext[1..]);
                     if path.exists() {
                         return path.into_os_string();
                     }
@@ -645,9 +640,33 @@ impl CommandBuilder {
             value,
         } in self.envs.values()
         {
-            block.extend(preferred_key.encode_wide());
+            let key: Vec<u16> = preferred_key.encode_wide().collect();
+
+            // CreateProcessW rejects the WHOLE block with ERROR_INVALID_PARAMETER
+            // (87) if any single entry is malformed.  Tangibly reproduced on
+            // Windows 11 build 26200 (tests/test_issue167_envblock_probe.ps1): a
+            // ConPTY passthrough spawn fails with err 87 when the block contains
+            // an entry with an empty name, a name beginning with '=', or an
+            // interior NUL.  The env map is populated from externally-controlled
+            // sources (the parent process environment and the HKLM/HKCU
+            // Environment registry keys), so a single corrupt value would
+            // otherwise silently break the warm-pane spawn ("flashes black,
+            // returns to prompt").  Sanitise rather than poison the block.
+            // See issue #167.
+            //
+            // - Empty name, or name starting with '=' (cmd.exe "=C:" drive vars):
+            //   skip entirely; pwsh/ConPTY do not need them and they always
+            //   trip err 87 on recent builds.
+            // - Interior NUL anywhere in the name: skip; the name is unusable.
+            if key.is_empty() || key[0] == b'=' as u16 || key.contains(&0) {
+                continue;
+            }
+
+            block.extend_from_slice(&key);
             block.push(b'=' as u16);
-            block.extend(value.encode_wide());
+            // Truncate the value at the first interior NUL rather than drop the
+            // whole variable, preserving as much of a usable value as possible.
+            block.extend(value.encode_wide().take_while(|&c| c != 0));
             block.push(0);
         }
         // and a final terminator for CreateProcessW
@@ -757,3 +776,7 @@ fn is_cwd_relative_path<P: AsRef<Path>>(p: P) -> bool {
 #[cfg(test)]
 #[path = "../../../tests-rs/test_cmdbuilder.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../../tests-rs/test_issue167_envblock.rs"]
+mod tests_issue167_envblock;

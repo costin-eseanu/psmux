@@ -1,11 +1,20 @@
 use crate::types::AppState;
 use crate::config::{format_key_binding, parse_key_string};
 
+/// Upper bound for `repeat-time`, in milliseconds. tmux declares the option as
+/// a number with minimum 0 and maximum 2000000 in options-table.c, so psmux
+/// refuses anything outside that range on every route (#606).
+pub(crate) const REPEAT_TIME_MAX_MS: i64 = 2_000_000;
+
 fn is_window_option(name: &str) -> bool {
     matches!(
         name,
         "automatic-rename"
             | "monitor-activity"
+            // #559: tmux classifies monitor-silence as a window option; without
+            // this entry `show-options -w monitor-silence` returned an empty
+            // value even after a successful `set -w monitor-silence N`.
+            | "monitor-silence"
             | "remain-on-exit"
             | "window-status-format"
             | "window-status-current-format"
@@ -21,15 +30,50 @@ fn is_window_option(name: &str) -> bool {
     )
 }
 
+/// Effective value of an option that is stored empty or not stored at all.
+///
+/// Several options live in `user_options` (or are simply left blank at startup)
+/// and the code that consumes them substitutes a built-in when the entry is
+/// missing. `show-options` has to report that built-in, otherwise it tells the
+/// user an option is unset when the feature is demonstrably active, and
+/// customize-mode shows a "default" the running session does not have.
+fn effective_when_unset(name: &str) -> Option<&'static str> {
+    Some(match name {
+        // Consumed at src/rendering.rs, missing entry means border_lines::DEFAULT.
+        "pane-border-lines" => crate::border_lines::DEFAULT,
+        // Consumed at src/server/helpers.rs, a missing entry disables the gutter.
+        "copy-mode-line-numbers" => "off",
+        "copy-mode-line-number-style" => "fg=brightblack",
+        "copy-mode-current-line-number-style" => "fg=yellow,bold",
+        // TERM handed to panes when default-terminal was never set.
+        "default-terminal" => "xterm-256color",
+        // tmux reports `default` for a style that has not been overridden.
+        "status-style" | "status-left-style" | "status-right-style"
+        | "message-style" | "message-command-style" | "mode-style"
+        | "pane-border-style" | "pane-active-border-style"
+        | "pane-border-hover-style" | "window-status-style"
+        | "window-status-current-style" | "window-status-activity-style"
+        | "window-status-bell-style" | "window-status-last-style" => "default",
+        _ => return None,
+    })
+}
+
 /// Get a single option's value by name (for `show-options -v name`).
 pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
-    match name {
+    let value = match name {
         "prefix" => format_key_binding(&app.prefix_key),
         "prefix2" => app.prefix2_key.as_ref().map(|k| format_key_binding(k)).unwrap_or_else(|| "none".to_string()),
         "base-index" => app.window_base_index.to_string(),
         "pane-base-index" => app.pane_base_index.to_string(),
         "escape-time" => app.escape_time_ms.to_string(),
         "mouse" => if app.mouse_enabled { "on".into() } else { "off".into() },
+        "bold-is-bright" => if app.bold_is_bright { "on".into() } else { "off".into() },
+        "scroll-enter-copy-mode" => if app.scroll_enter_copy_mode { "on".into() } else { "off".into() },
+        "pwsh-mouse-selection" => if app.pwsh_mouse_selection { "on".into() } else { "off".into() },
+        "mouse-selection" => if app.mouse_selection { "on".into() } else { "off".into() },
+        "mouse-selection-force" => if app.mouse_selection_force { "on".into() } else { "off".into() },
+        "paste-detection" => if app.paste_detection { "on".into() } else { "off".into() },
+        "choose-tree-preview" => if app.choose_tree_preview { "on".into() } else { "off".into() },
         "status" => {
             if !app.status_visible { "off".into() }
             else if app.status_lines >= 2 { app.status_lines.to_string() }
@@ -46,22 +90,45 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
         "renumber-windows" => if app.renumber_windows { "on".into() } else { "off".into() },
         "automatic-rename" => if app.automatic_rename { "on".into() } else { "off".into() },
         "allow-rename" => if app.allow_rename { "on".into() } else { "off".into() },
+        "allow-set-title" => if app.allow_set_title { "on".into() } else { "off".into() },
         "monitor-activity" => if app.monitor_activity { "on".into() } else { "off".into() },
+        "visual-activity" => if app.visual_activity { "on".into() } else { "off".into() },
+        "aggressive-resize" => if app.aggressive_resize { "on".into() } else { "off".into() },
         "synchronize-panes" => if app.sync_input { "on".into() } else { "off".into() },
         "remain-on-exit" => if app.remain_on_exit { "on".into() } else { "off".into() },
         "destroy-unattached" => if app.destroy_unattached { "on".into() } else { "off".into() },
         "exit-empty" => if app.exit_empty { "on".into() } else { "off".into() },
         "set-titles" => if app.set_titles { "on".into() } else { "off".into() },
-        "set-titles-string" => app.set_titles_string.clone(),
+        // Report the format that actually drives the host title. An empty stored
+        // value means "use the built-in", so report the built-in, not a blank.
+        "set-titles-string" => if app.set_titles_string.is_empty() {
+            "#S:#I:#W".to_string()
+        } else {
+            app.set_titles_string.clone()
+        },
+        // repeat-time had no arm at all, so `show-options -v repeat-time`
+        // returned an empty string even though the option works.
+        "repeat-time" => app.repeat_time_ms.to_string(),
+        // Reports what the server process is ACTUALLY running at, which is not
+        // always what a config file asked for: PSMUX_PRIORITY outranks the
+        // option, and the startup resolve stores the winner here (#608).
+        "priority" => app.priority.clone(),
         "prediction-dimming" => if app.prediction_dimming { "on".into() } else { "off".into() },
         "allow-predictions" => if app.allow_predictions { "on".into() } else { "off".into() },
         "cursor-style" => std::env::var("PSMUX_CURSOR_STYLE").unwrap_or_else(|_| "bar".to_string()),
         "cursor-blink" => if std::env::var("PSMUX_CURSOR_BLINK").unwrap_or_else(|_| "1".to_string()) != "0" { "on".into() } else { "off".into() },
-        "default-shell" | "default-command" => app.default_shell.clone(),
+        "default-shell" | "default-command" => {
+            if app.default_shell.is_empty() {
+                crate::pane::cached_shell().unwrap_or("pwsh.exe").to_string()
+            } else {
+                app.default_shell.clone()
+            }
+        }
         "default-terminal" => app.environment.get("TERM").cloned().unwrap_or_default(),
         "word-separators" => app.word_separators.clone(),
         "pane-border-style" => app.pane_border_style.clone(),
         "pane-active-border-style" => app.pane_active_border_style.clone(),
+        "pane-border-hover-style" => app.pane_border_hover_style.clone(),
         "status-style" => app.status_style.clone(),
         "window-status-format" => app.window_status_format.clone(),
         "window-status-current-format" => app.window_status_current_format.clone(),
@@ -99,29 +166,82 @@ pub(crate) fn get_option_value(app: &AppState, name: &str) -> String {
                 .join(",")
         }
         "warm" => if app.warm_enabled { "on".into() } else { "off".into() },
+        "alternate-screen" => if app.allow_alternate_screen { "on".into() } else { "off".into() },
         "claude-code-fix-tty" => if app.claude_code_fix_tty { "on".into() } else { "off".into() },
         "claude-code-force-interactive" => if app.claude_code_force_interactive { "on".into() } else { "off".into() },
+        "session-group" => app.session_group.clone().unwrap_or_default(),
         _ => {
             // Check user_options first (@-prefixed), then environment
             app.user_options.get(name).cloned()
                 .or_else(|| app.environment.get(name).cloned())
                 .unwrap_or_default()
         }
+    };
+
+    // An empty result means "never set". Report what the feature will actually
+    // use so `show-options` and customize-mode agree with the running session.
+    if value.is_empty() {
+        if let Some(effective) = effective_when_unset(name) {
+            return effective.to_string();
+        }
     }
+    value
 }
 
 pub(crate) fn get_window_option_value(app: &AppState, name: &str) -> String {
-    if is_window_option(name) {
-        get_option_value(app, name)
-    } else {
-        String::new()
+    get_window_option_value_for(app, name, None)
+}
+
+/// Window-scoped option lookup that honours per-window overrides.
+///
+/// `target_window` selects which window to read from (e.g. for
+/// `show-options -w -v automatic-rename -t SESSION:N`).  `None` means
+/// "active window", which matches what tmux does when `-t` is omitted.
+///
+/// Currently only `automatic-rename` has a real per-window override
+/// (driven by `Window::manual_rename`, which is set when the window is
+/// created with `-n NAME` or renamed via `rename-window`).  Other
+/// window options fall through to the global value — they don't have
+/// per-window storage in psmux today and tmux also defaults to the
+/// global value when no window-local override is set.
+///
+/// See psmux issue #266: prior to this helper, `show-options -w
+/// automatic-rename` always returned the global value, so windows
+/// born with `-n NAME` (which correctly set `manual_rename = true`)
+/// still reported `automatic-rename on`, even though the rename loop
+/// was correctly skipping them.  The bug was reporting-only on those
+/// windows, but the spec violation could mislead user scripts that
+/// branched on the option value.
+pub(crate) fn get_window_option_value_for(
+    app: &AppState,
+    name: &str,
+    target_window: Option<usize>,
+) -> String {
+    if !is_window_option(name) {
+        return String::new();
     }
+    if name == "automatic-rename" {
+        let idx = target_window.unwrap_or(app.active_idx);
+        if let Some(w) = app.windows.get(idx) {
+            if w.manual_rename {
+                return "off".into();
+            }
+        }
+    }
+    if name == "window-size" {
+        let idx = target_window.unwrap_or(app.active_idx);
+        if let Some(value) = app.windows.get(idx).and_then(|window| window.window_size.as_ref()) {
+            return value.clone();
+        }
+    }
+    get_option_value(app, name)
 }
 
 pub(crate) fn render_window_options(app: &AppState) -> String {
     let names = [
         "automatic-rename",
         "monitor-activity",
+        "monitor-silence",
         "remain-on-exit",
         "window-status-format",
         "window-status-current-format",
@@ -138,9 +258,144 @@ pub(crate) fn render_window_options(app: &AppState) -> String {
 
     let mut output = String::new();
     for name in names {
-        output.push_str(&format!("{} {}\n", name, get_option_value(app, name)));
+        output.push_str(&format!("{} {}\n", name, get_window_option_value(app, name)));
     }
     output
+}
+
+/// Returns `true` if the given option name is a boolean (on/off) option.
+/// Used by set-option toggle logic (tmux parity: `set <option>` without a
+/// value toggles boolean options).
+pub(crate) fn is_boolean_option(name: &str) -> bool {
+    matches!(
+        name,
+        "mouse"
+            | "bold-is-bright"
+            | "scroll-enter-copy-mode"
+            | "pwsh-mouse-selection"
+            | "mouse-selection"
+            | "mouse-selection-force"
+            | "paste-detection"
+            | "choose-tree-preview"
+            | "focus-events"
+            | "renumber-windows"
+            | "automatic-rename"
+            | "allow-rename"
+            | "allow-set-title"
+            | "monitor-activity"
+            | "visual-activity"
+            | "synchronize-panes"
+            | "remain-on-exit"
+            | "destroy-unattached"
+            | "exit-empty"
+            | "set-titles"
+            | "aggressive-resize"
+            | "visual-bell"
+            | "prediction-dimming"
+            | "allow-predictions"
+            | "cursor-blink"
+            | "warm"
+            | "alternate-screen"
+            | "claude-code-fix-tty"
+            | "claude-code-force-interactive"
+            | "status"
+    )
+}
+
+/// How a `set-option` that names an option but supplies **no value** must be
+/// handled (issue #535). tmux 3.4 splits this case in two:
+///
+/// * boolean/flag options toggle silently and exit 0 (`set -g mouse` flips
+///   on<->off). psmux already did this for config-file lines (#278);
+/// * every other option is an error: `empty value` on stderr, exit 1.
+///
+/// `-q` deliberately does **not** enter into it. Both psmux's own CLI help and
+/// tmux's manual scope `-q` to "errors about unknown or ambiguous options";
+/// verified against tmux 3.4, where `set -gq @foo` still fails with
+/// `empty value`. Callers must route the no-value case through here rather
+/// than dropping it, which is what let #535 pass silently with exit 0.
+pub(crate) fn missing_value_toggles(option: &str) -> bool {
+    is_boolean_option(option)
+}
+
+/// Toggle a boolean option: read current value and flip it.
+/// Returns `true` if the option was toggled, `false` if not a boolean option.
+pub(crate) fn toggle_option(app: &mut AppState, option: &str) -> bool {
+    if !is_boolean_option(option) {
+        return false;
+    }
+    let current = get_option_value(app, option);
+    let new_value = if current == "on" { "off" } else { "on" };
+    apply_set_option(app, option, new_value, false);
+    true
+}
+
+/// Restore one option to the value a freshly started server reports for it,
+/// which is what `set-option -u` means (#619 follow up).
+///
+/// tmux does this in one place, `options_remove_or_default` (options.c ~1457):
+///
+/// ```c
+/// if (o->tableentry != NULL &&
+///     (oo == global_options || oo == global_s_options || oo == global_w_options))
+///         options_default(oo, o->tableentry);
+/// else
+///         options_remove(o);
+/// ```
+///
+/// so at a global scope a table option goes back to its options table default
+/// and only a **user** option, which carries no table entry, is removed
+/// outright.
+///
+/// psmux had no such single place. The unset was open coded three times and
+/// each copy was wrong in its own way:
+///
+/// * the server request loop carried a hand written per option restore table of
+///   about thirty arms with a `_ => {}` catch all, so every option it had never
+///   heard of simply kept its value: `set -s default-terminal xterm-256color`
+///   followed by `set -su default-terminal` still read `xterm-256color`, and
+///   `status-left` was restored to `psmux:#I` where a fresh server reports
+///   `[#S] `;
+/// * the config parser wrote an EMPTY value instead of a default, so
+///   `set -gu escape-time` in a config file left the old number where the CLI
+///   restored 500;
+/// * the plugin drain loop only erased the explicit set mark and never touched
+///   the value at all.
+///
+/// `OPTION_CATALOG` already carries a default for every option it lists, and
+/// `tests-rs/test_option_default_parity.rs` pins each of those defaults to a
+/// freshly constructed `AppState`, so the catalog IS the options table psmux
+/// was missing. Restoring through it means the table is written once, and the
+/// parity test keeps it honest.
+pub(crate) fn reset_option_to_default(app: &mut AppState, option: &str) {
+    let key = option.trim();
+    if key.is_empty() {
+        return;
+    }
+
+    // Forget that the user ever set it, so a following `-o` sees an unset
+    // option and applies (#619). tmux gets this for free because `-o` is
+    // judged by `options_get_only`, which the unset has already cleared.
+    app.user_set_options.remove(key);
+
+    // A `@user` option has no table entry, so tmux takes the `options_remove`
+    // branch: the key goes away rather than falling back to a default that
+    // does not exist. `-o` tests user options by key presence, so an entry
+    // left holding "" would read as set for ever.
+    if key.starts_with('@') {
+        app.user_options.remove(key);
+        return;
+    }
+
+    // Drop any stored override first. Options that live ONLY in `user_options`
+    // (window-style and window-active-style, terminal-overrides) have no typed
+    // field to restore and `get_option_value` already answers with the built in
+    // for a missing entry, so removal is the whole restore for them.
+    app.user_options.remove(key);
+
+    if let Some(default) = crate::server::option_catalog::default_for(key) {
+        apply_set_option(app, key, default, true);
+    }
 }
 
 /// Apply a set-option command. If `quiet` is true, unknown options are silently ignored.
@@ -156,6 +411,7 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
         }
         "base-index" => {
             if let Ok(idx) = value.parse::<usize>() {
+                app.rebase_window_indices(idx);
                 app.window_base_index = idx;
             }
         }
@@ -164,10 +420,32 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
                 app.pane_base_index = idx;
             }
         }
-        "mouse" => { app.mouse_enabled = value == "on" || value == "true" || value == "1"; }
+        "mouse" => { app.mouse_enabled = value == "on" || value == "true" || value == "1" || value == "yes"; }
+        "bold-is-bright" => {
+            app.bold_is_bright = matches!(value, "on" | "true" | "1" | "yes");
+            crate::platform::set_bold_is_bright(app.bold_is_bright);
+        }
+        // Field write plus the platform call in one arm, the bold-is-bright
+        // shape, so every set path (config file, CLI, in-TUI prompt, control
+        // mode) applies to the live server process without its own hook.
+        // An unusable value is refused rather than stored, so the class and
+        // the reported option both stay where they were (#608).
+        "priority" => {
+            if crate::platform::normalize_priority(value).is_some() {
+                app.priority = crate::platform::resolve_priority(Some(value), false);
+                crate::platform::set_process_priority(&app.priority);
+            }
+        }
+        "scroll-enter-copy-mode" => { app.scroll_enter_copy_mode = matches!(value, "on" | "true" | "1" | "yes"); }
+        "pwsh-mouse-selection" => { app.pwsh_mouse_selection = matches!(value, "on" | "true" | "1" | "yes"); }
+        "mouse-selection" => { app.mouse_selection = matches!(value, "on" | "true" | "1" | "yes"); }
+        "mouse-selection-force" => { app.mouse_selection_force = matches!(value, "on" | "true" | "1" | "yes"); }
+        "paste-detection" => { app.paste_detection = matches!(value, "on" | "true" | "1" | "yes"); }
+        "choose-tree-preview" => { app.choose_tree_preview = matches!(value, "on" | "true" | "1" | "yes"); }
         "prefix" => {
             if let Some(kc) = parse_key_string(value) {
                 app.prefix_key = kc;
+                crate::config::ensure_prefix_self_binding(app);
             }
         }
         "prefix2" => {
@@ -185,7 +463,17 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
         "history-limit" => {
             if let Ok(limit) = value.parse::<usize>() {
                 app.history_limit = limit;
+                // Warm pane reconciliation is handled centrally by
+                // warm_pane_sync::for_option_change once the caller
+                // runs apply_set_option here — see #271.
             }
+        }
+        "alternate-screen" => {
+            app.allow_alternate_screen = matches!(value, "on" | "true" | "1" | "yes");
+            // The flag is enforced inside the vt100 parser of each
+            // pane.  warm_pane_sync::for_option_change patches the
+            // existing warm pane's parser and walks live panes so the
+            // change takes effect immediately (psmux issue #88).
         }
         "display-time" => {
             if let Ok(ms) = value.parse::<u64>() {
@@ -198,8 +486,14 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
             }
         }
         "repeat-time" => {
-            if let Ok(ms) = value.parse::<u64>() {
-                app.repeat_time_ms = ms;
+            // Bounded like tmux (options-table.c: minimum 0, maximum
+            // 2000000 ms). An out of range value is refused rather than
+            // stored, so the command prompt and TCP routes cannot install a
+            // repeat window the CLI guard would have rejected (#606).
+            if let Ok(ms) = value.parse::<i64>() {
+                if (0..=REPEAT_TIME_MAX_MS).contains(&ms) {
+                    app.repeat_time_ms = ms as u64;
+                }
             }
         }
         "mode-keys" => { app.mode_keys = value.to_string(); }
@@ -246,12 +540,12 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
                 format!("{},fg={}", filtered, value)
             };
         }
-        "focus-events" => { app.focus_events = matches!(value, "on" | "true" | "1"); }
-        "renumber-windows" => { app.renumber_windows = matches!(value, "on" | "true" | "1"); }
-        "remain-on-exit" => { app.remain_on_exit = matches!(value, "on" | "true" | "1"); }
-        "destroy-unattached" => { app.destroy_unattached = matches!(value, "on" | "true" | "1"); }
-        "exit-empty" => { app.exit_empty = matches!(value, "on" | "true" | "1"); }
-        "set-titles" => { app.set_titles = matches!(value, "on" | "true" | "1"); }
+        "focus-events" => { app.focus_events = matches!(value, "on" | "true" | "1" | "yes"); }
+        "renumber-windows" => { app.renumber_windows = matches!(value, "on" | "true" | "1" | "yes"); }
+        "remain-on-exit" => { app.remain_on_exit = matches!(value, "on" | "true" | "1" | "yes"); }
+        "destroy-unattached" => { app.destroy_unattached = matches!(value, "on" | "true" | "1" | "yes"); }
+        "exit-empty" => { app.exit_empty = matches!(value, "on" | "true" | "1" | "yes"); }
+        "set-titles" => { app.set_titles = matches!(value, "on" | "true" | "1" | "yes"); }
         "set-titles-string" => { app.set_titles_string = value.to_string(); }
         "default-command" | "default-shell" => {
             // Strip surrounding quotes only when the entire value is wrapped
@@ -268,12 +562,12 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
             app.default_shell = stripped.to_string();
         }
         "word-separators" => { app.word_separators = value.to_string(); }
-        "aggressive-resize" => { app.aggressive_resize = matches!(value, "on" | "true" | "1"); }
-        "monitor-activity" => { app.monitor_activity = matches!(value, "on" | "true" | "1"); }
-        "visual-activity" => { app.visual_activity = matches!(value, "on" | "true" | "1"); }
-        "synchronize-panes" => { app.sync_input = matches!(value, "on" | "true" | "1"); }
+        "aggressive-resize" => { app.aggressive_resize = matches!(value, "on" | "true" | "1" | "yes"); }
+        "monitor-activity" => { app.monitor_activity = matches!(value, "on" | "true" | "1" | "yes"); }
+        "visual-activity" => { app.visual_activity = matches!(value, "on" | "true" | "1" | "yes"); }
+        "synchronize-panes" => { app.sync_input = matches!(value, "on" | "true" | "1" | "yes"); }
         "automatic-rename" => {
-            app.automatic_rename = matches!(value, "on" | "true" | "1");
+            app.automatic_rename = matches!(value, "on" | "true" | "1" | "yes");
             // When user explicitly enables automatic-rename, clear manual_rename
             // on the active window so auto-rename can take effect again.
             if app.automatic_rename {
@@ -282,9 +576,15 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
                 }
             }
         }
-        "allow-rename" => { app.allow_rename = matches!(value, "on" | "true" | "1"); }
+        "allow-rename" => { app.allow_rename = matches!(value, "on" | "true" | "1" | "yes"); }
+        "allow-set-title" => { app.allow_set_title = matches!(value, "on" | "true" | "1" | "yes"); }
         "activity-action" => { app.activity_action = value.to_string(); }
         "silence-action" => { app.silence_action = value.to_string(); }
+        "bell-action" => { app.bell_action = value.to_string(); }
+        "visual-bell" => { app.visual_bell = matches!(value, "on" | "true" | "1" | "yes"); }
+        "monitor-silence" => {
+            if let Ok(n) = value.parse::<u64>() { app.monitor_silence = n; }
+        }
         "update-environment" => {
             app.update_environment = value.split_whitespace().map(|s| s.to_string()).collect();
         }
@@ -292,12 +592,18 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
             app.prediction_dimming = !matches!(value, "off" | "false" | "0");
         }
         "allow-predictions" => {
-            app.allow_predictions = matches!(value, "on" | "true" | "1");
+            app.allow_predictions = matches!(value, "on" | "true" | "1" | "yes");
         }
         "cursor-style" => { std::env::set_var("PSMUX_CURSOR_STYLE", value); }
-        "cursor-blink" => { std::env::set_var("PSMUX_CURSOR_BLINK", if matches!(value, "on"|"true"|"1") { "1" } else { "0" }); }
+        "cursor-blink" => {
+            let on = matches!(value, "on"|"true"|"1");
+            std::env::set_var("PSMUX_CURSOR_BLINK", if on { "1" } else { "0" });
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), if on { b"\x1b[?12h" } else { b"\x1b[?12l" });
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
         "pane-border-style" => { app.pane_border_style = value.to_string(); }
         "pane-active-border-style" => { app.pane_active_border_style = value.to_string(); }
+        "pane-border-hover-style" => { app.pane_border_hover_style = value.to_string(); }
         "window-status-format" => { app.window_status_format = value.to_string(); }
         "window-status-current-format" => { app.window_status_current_format = value.to_string(); }
         "window-status-separator" => { app.window_status_separator = value.to_string(); }
@@ -334,22 +640,19 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
             }
         }
         "warm" => {
-            app.warm_enabled = matches!(value, "on" | "true" | "1");
+            app.warm_enabled = matches!(value, "on" | "true" | "1" | "yes");
             // When warm is disabled, kill any existing warm pane AND warm server
             if !app.warm_enabled {
                 if let Some(mut wp) = app.warm_pane.take() {
                     wp.child.kill().ok();
                 }
                 // Kill the background warm server process
-                let home = std::env::var("USERPROFILE")
-                    .or_else(|_| std::env::var("HOME"))
-                    .unwrap_or_default();
                 let warm_base = if let Some(ref sn) = app.socket_name {
                     format!("{}____warm__", sn)
                 } else {
                     "__warm__".to_string()
                 };
-                let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
+                let warm_port_path = crate::paths::port_file(&warm_base);
                 if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
                         let addr = format!("127.0.0.1:{}", port);
@@ -363,15 +666,22 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
                     }
                 }
                 let _ = std::fs::remove_file(&warm_port_path);
-                let warm_key_path = format!("{}\\.psmux\\{}.key", home, warm_base);
+                let warm_key_path = crate::paths::key_file(&warm_base);
                 let _ = std::fs::remove_file(&warm_key_path);
             }
         }
         "claude-code-fix-tty" => {
-            app.claude_code_fix_tty = matches!(value, "on" | "true" | "1");
+            app.claude_code_fix_tty = matches!(value, "on" | "true" | "1" | "yes");
         }
         "claude-code-force-interactive" => {
-            app.claude_code_force_interactive = matches!(value, "on" | "true" | "1");
+            app.claude_code_force_interactive = matches!(value, "on" | "true" | "1" | "yes");
+        }
+        "session-group" => {
+            if value.is_empty() || value == "none" {
+                app.session_group = None;
+            } else {
+                app.session_group = Some(value.to_string());
+            }
         }
         _ => {
             // Handle status-format[N] patterns
@@ -405,3 +715,19 @@ pub(crate) fn apply_set_option(app: &mut AppState, option: &str, value: &str, _q
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue266_per_window_autorename.rs"]
+mod tests_issue266_per_window_autorename;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue278_toggle_bool_option.rs"]
+mod tests_issue278_toggle_bool_option;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue535_setoption_no_value.rs"]
+mod tests_issue535_setoption_no_value;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_issue559_monitor_silence_options.rs"]
+mod tests_issue559_monitor_silence_options;

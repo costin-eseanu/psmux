@@ -49,6 +49,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::type_complexity)]
 
+#[cfg(test)]
+extern crate self as vt100;
+
 mod attrs;
 mod callbacks;
 mod cell;
@@ -59,7 +62,7 @@ mod row;
 mod screen;
 mod term;
 
-pub use attrs::Color;
+pub use attrs::{Color, UnderlineStyle};
 pub use callbacks::Callbacks;
 pub use cell::Cell;
 pub use parser::Parser;

@@ -66,9 +66,20 @@ foreach ($line in $lines2) {
 }
 Check "No trailing whitespace on non-empty lines" (-not $has_trailing_spaces)
 
-# Check that empty lines are preserved (tmux behavior)
-$empty_lines_exist = ($lines2 | Where-Object { $_.Trim() -eq "" }).Count -gt 0
-Check "Empty lines are preserved" $empty_lines_exist
+# Interior empty lines must be preserved (tmux parity). psmux intentionally
+# trims TRAILING blank lines from the default (no-range) capture so iTerm2 does
+# not advance its cursor past the content on initial attach, so the meaningful
+# property to assert is that a blank line BETWEEN two non-blank lines survives.
+& $exe send-keys -t $SESSION "Write-Host 'IBLANKA'; Write-Host ''; Write-Host 'IBLANKB'" Enter
+Start-Sleep -Seconds 1
+$capIB = (& $exe capture-pane -t $SESSION -p 2>&1) -split "`n"
+$idxA = -1; $idxB = -1
+for ($i = 0; $i -lt $capIB.Count; $i++) {
+    if ($capIB[$i].Trim() -eq "IBLANKA") { $idxA = $i }
+    elseif ($capIB[$i].Trim() -eq "IBLANKB") { $idxB = $i }
+}
+$interior_blank_preserved = ($idxA -ge 0 -and $idxB -eq ($idxA + 2) -and $capIB[$idxA + 1].Trim() -eq "")
+Check "Interior empty lines are preserved" $interior_blank_preserved
 
 # =============================================================================
 # TEST 3: capture-pane without -p (stores in paste buffer)
@@ -89,19 +100,27 @@ Write-Host "`n--- TEST 4: Range capture -S 0 -E 5 ---" -ForegroundColor Yellow
 $lines4 = (& $exe capture-pane -t $SESSION -p -S 0 -E 5 2>&1) -split "`n"
 # Filter out truly empty trailing entries from split
 $non_null4 = $lines4 | Where-Object { $_ -ne $null }
-# Should have at most 6 lines (0 through 5) plus possibly a trailing empty from final newline
-Check "-S 0 -E 5 returns ~6 lines" ($non_null4.Count -ge 4 -and $non_null4.Count -le 7)
+# An explicit range is honored line for line (tmux parity): 6 rows requested
+# (0 through 5), and trailing blank rows INSIDE the range are preserved rather
+# than collapsed. So the count is the 6 requested lines (a trailing newline may
+# add one empty split entry). Before the fix this returned only the ~3 non-blank
+# lines because the range path wrongly reused the attach path's trailing-blank trim.
+Check "-S 0 -E 5 returns the 6 requested lines" ($non_null4.Count -ge 6 -and $non_null4.Count -le 7)
 
 # =============================================================================
-# TEST 5: capture-pane -S -3 (last 3 lines relative to bottom)
+# TEST 5: capture-pane -S -3 (3 lines of scrollback above visible top, per tmux)
 # =============================================================================
 Write-Host "`n--- TEST 5: Negative offset -S -3 ---" -ForegroundColor Yellow
 
 $lines5 = (& $exe capture-pane -t $SESSION -p -S -3 2>&1) -split "`n"
 $non_null5 = $lines5 | Where-Object { $_ -ne $null }
-# Should get approximately 3 lines (from row (height-3) to end)
-Check "-S -3 returns small number of lines" ($non_null5.Count -le 6)
+# Per tmux semantics, -S -N means "N lines above visible top" so the result
+# should include up to N scrollback lines + the full visible pane (~24 rows on
+# default geometry). When no scrollback is available it clamps to the visible
+# pane. So the count should be at least 2 lines and not absurdly larger than
+# pane height + a few scrollback rows.
 Check "-S -3 returns at least 2 lines" ($non_null5.Count -ge 2)
+Check "-S -3 returns scrollback + visible (within sane bound)" ($non_null5.Count -le 200)
 
 # =============================================================================
 # TEST 6: capture-pane -S 0 -E 0 (single line)

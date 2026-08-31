@@ -121,6 +121,8 @@ fn mock_window(name: &str) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id: 0,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -130,6 +132,9 @@ fn mock_window(name: &str) -> crate::types::Window {
         layout_index: 0,
         pane_mru: vec![],
         zoom_saved: None,
+        linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -339,6 +344,12 @@ fn test_appstate_defaults_bell_action() {
 }
 
 #[test]
+fn test_appstate_defaults_bell_forward() {
+    let app = mock_app();
+    assert!(!app.bell_forward, "bell_forward must default to false");
+}
+
+#[test]
 fn test_appstate_defaults_activity_action() {
     let app = mock_app();
     assert_eq!(app.activity_action, "other");
@@ -362,4 +373,258 @@ fn test_appstate_defaults_update_environment() {
     assert!(app.update_environment.contains(&"DISPLAY".to_string()));
     assert!(app.update_environment.contains(&"SSH_AUTH_SOCK".to_string()));
     assert!(app.update_environment.contains(&"SSH_AGENT_PID".to_string()));
+}
+
+// ── Session group format variable tests ─────────────────────────
+
+#[test]
+fn test_session_group_empty_by_default() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    assert_eq!(expand_var("session_group", &app, 0), "");
+}
+
+#[test]
+fn test_session_group_returns_group_name() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.session_group = Some("mygroup".to_string());
+    assert_eq!(expand_var("session_group", &app, 0), "mygroup");
+}
+
+#[test]
+fn test_session_group_list_returns_group_name() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.session_group = Some("mygroup".to_string());
+    assert_eq!(expand_var("session_group_list", &app, 0), "mygroup");
+}
+
+#[test]
+fn test_session_grouped_false_by_default() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    assert_eq!(expand_var("session_grouped", &app, 0), "0");
+}
+
+#[test]
+fn test_session_grouped_true_when_in_group() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.session_group = Some("grp".to_string());
+    assert_eq!(expand_var("session_grouped", &app, 0), "1");
+}
+
+#[test]
+fn test_session_group_attached_when_grouped_and_attached() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.session_group = Some("grp".to_string());
+    app.attached_clients = 1;
+    assert_eq!(expand_var("session_group_attached", &app, 0), "1");
+}
+
+#[test]
+fn test_session_group_attached_zero_when_not_grouped() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.attached_clients = 1;
+    assert_eq!(expand_var("session_group_attached", &app, 0), "0");
+}
+
+#[test]
+fn test_session_group_attached_zero_when_no_clients() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.session_group = Some("grp".to_string());
+    app.attached_clients = 0;
+    assert_eq!(expand_var("session_group_attached", &app, 0), "0");
+}
+
+#[test]
+fn test_session_group_size_when_grouped() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.session_group = Some("grp".to_string());
+    assert_eq!(expand_var("session_group_size", &app, 0), "1");
+}
+
+#[test]
+fn test_session_group_size_zero_when_not_grouped() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    assert_eq!(expand_var("session_group_size", &app, 0), "0");
+}
+
+// ── Window linked format variable tests ─────────────────────────
+
+#[test]
+fn test_window_linked_false_by_default() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    assert_eq!(expand_var("window_linked", &app, 0), "0");
+}
+
+#[test]
+fn test_window_linked_true_when_linked() {
+    let mut app = mock_app();
+    let mut win = mock_window("win0");
+    win.linked_from = Some(42);
+    app.windows.push(win);
+    assert_eq!(expand_var("window_linked", &app, 0), "1");
+}
+
+#[test]
+fn test_window_linked_sessions_mirrors_linked() {
+    let mut app = mock_app();
+    let mut win = mock_window("win0");
+    win.linked_from = Some(5);
+    app.windows.push(win);
+    assert_eq!(expand_var("window_linked_sessions", &app, 0), "1");
+}
+
+#[test]
+fn test_window_linked_sessions_list_empty() {
+    let mut app = mock_app();
+    let mut win = mock_window("win0");
+    win.linked_from = Some(5);
+    app.windows.push(win);
+    assert_eq!(expand_var("window_linked_sessions_list", &app, 0), "");
+}
+
+// ── Pane fg/bg default tests ────────────────────────────────────
+// Without a real PTY pane, pane_fg and pane_bg should return "default"
+
+#[test]
+fn test_pane_fg_default_without_real_pane() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    // No panes in the split node, so target_pane() returns None -> "default"
+    assert_eq!(expand_var("pane_fg", &app, 0), "default");
+}
+
+#[test]
+fn test_pane_bg_default_without_real_pane() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    assert_eq!(expand_var("pane_bg", &app, 0), "default");
+}
+
+// ── Mouse position format variable tests ────────────────────────
+
+#[test]
+fn test_mouse_x_initial_zero() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    assert_eq!(expand_var("mouse_x", &app, 0), "0");
+}
+
+#[test]
+fn test_mouse_y_initial_zero() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    assert_eq!(expand_var("mouse_y", &app, 0), "0");
+}
+
+#[test]
+fn test_mouse_x_tracks_last_position() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.last_mouse_x = 42;
+    assert_eq!(expand_var("mouse_x", &app, 0), "42");
+}
+
+#[test]
+fn test_mouse_y_tracks_last_position() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.last_mouse_y = 17;
+    assert_eq!(expand_var("mouse_y", &app, 0), "17");
+}
+
+// ── Session many_attached format variable tests ─────────────────
+
+#[test]
+fn test_session_many_attached_zero_single_client() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.attached_clients = 1;
+    assert_eq!(expand_var("session_many_attached", &app, 0), "0");
+}
+
+#[test]
+fn test_session_many_attached_one_when_multiple() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.attached_clients = 3;
+    assert_eq!(expand_var("session_many_attached", &app, 0), "1");
+}
+
+// ── Session format var (alias for session_many_attached) ────────
+
+#[test]
+fn test_session_format_alias() {
+    let mut app = mock_app();
+    app.windows.push(mock_window("win0"));
+    app.attached_clients = 2;
+    assert_eq!(expand_var("session_format", &app, 0), "1");
+}
+
+// ── Issue #164: expand_format must preserve #[style] directives ──
+
+#[test]
+fn test_expand_format_preserves_style_directives() {
+    let app = mock_app();
+    // #[fg=red] should pass through expand_format unchanged
+    let result = expand_format("#[fg=red]Custom Line 2", &app);
+    assert_eq!(result, "#[fg=red]Custom Line 2",
+        "expand_format must not eat #[fg=red] directive");
+}
+
+#[test]
+fn test_expand_format_preserves_align_directive() {
+    let app = mock_app();
+    let result = expand_format("#[align=left]Custom Line 1", &app);
+    assert_eq!(result, "#[align=left]Custom Line 1",
+        "expand_format must not eat #[align=left] directive");
+}
+
+#[test]
+fn test_expand_format_mixed_variables_and_styles() {
+    let mut app = mock_app();
+    app.session_name = "main".to_string();
+    // Mix of style directive and variable expansion
+    let result = expand_format("#[fg=red]session: #S", &app);
+    assert_eq!(result, "#[fg=red]session: main",
+        "Style directives preserved and variables expanded");
+}
+
+#[test]
+fn test_expand_format_multiple_style_blocks() {
+    let app = mock_app();
+    let result = expand_format("#[fg=red]Hello #[fg=green]World", &app);
+    assert_eq!(result, "#[fg=red]Hello #[fg=green]World",
+        "Multiple style blocks must all be preserved");
+}
+
+#[test]
+fn test_expand_format_complex_style() {
+    let app = mock_app();
+    let result = expand_format("#[fg=yellow,bg=blue,bold]Styled Text", &app);
+    assert_eq!(result, "#[fg=yellow,bg=blue,bold]Styled Text",
+        "Complex style directives must be preserved");
+}
+
+#[test]
+fn test_session_path_is_server_cwd() {
+    // tmux: #{session_path} is the working directory of the session. psmux has
+    // no per-session cwd, so it resolves to the server's current directory --
+    // the same source #{pane_current_path} falls back to. It must NOT be the
+    // user's home directory.
+    let app = mock_app();
+    let expected = std::env::current_dir()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    assert_eq!(expand_format("#{session_path}", &app), expected,
+        "#{{session_path}} must resolve to the session (server) working directory");
 }

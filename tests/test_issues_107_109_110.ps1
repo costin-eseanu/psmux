@@ -25,7 +25,7 @@ Write-Info "Using: $PSMUX"
 # Clean slate
 Write-Info "Cleaning up existing sessions..."
 & $PSMUX kill-server 2>$null
-Start-Sleep -Seconds 3
+Start-Sleep -Milliseconds 1500
 Remove-Item "$env:USERPROFILE\.psmux\*.port" -Force -ErrorAction SilentlyContinue
 Remove-Item "$env:USERPROFILE\.psmux\*.key" -Force -ErrorAction SilentlyContinue
 
@@ -70,11 +70,11 @@ try {
     if (-not (Wait-ForSession $S107)) { Write-Fail "107.1: Session did not start"; throw "skip" }
 
     # Let the warm pane fully spawn so we test the stash logic
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds 1500
 
     # Split with -c pointing to our test directory
     & $PSMUX split-window -h -c $testDir -t $S107 2>&1 | Out-Null
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     # Ask the new pane for its CWD
     & $PSMUX send-keys -t $S107 "pwd" Enter
@@ -82,7 +82,9 @@ try {
     $cap = Capture-Pane $S107
     $dirName = Split-Path $testDir -Leaf
 
-    if ($cap -match [regex]::Escape($dirName)) {
+    # Flatten line-breaks first: the console wraps long paths mid-name (same
+    # fix 107.4 already carries), so a raw match false-fails on wrapped output.
+    if (($cap -replace "`r?`n", "") -match [regex]::Escape($dirName)) {
         Write-Pass "107.1: split-window -h -c sets CWD (found $dirName)"
     } else {
         Write-Fail "107.1: CWD not set. Expected '$dirName' in output. Got:`n$cap"
@@ -102,17 +104,17 @@ try {
 
     Start-Process -FilePath $PSMUX -ArgumentList "new-session -d -s $S107" -WindowStyle Hidden
     if (-not (Wait-ForSession $S107)) { Write-Fail "107.2: Session did not start"; throw "skip" }
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds 1500
 
     & $PSMUX split-window -v -c $testDir -t $S107 2>&1 | Out-Null
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     & $PSMUX send-keys -t $S107 "pwd" Enter
     Start-Sleep -Seconds 2
     $cap = Capture-Pane $S107
     $dirName = Split-Path $testDir -Leaf
 
-    if ($cap -match [regex]::Escape($dirName)) {
+    if (($cap -replace "`r?`n", "") -match [regex]::Escape($dirName)) {
         Write-Pass "107.2: split-window -v -c sets CWD (found $dirName)"
     } else {
         Write-Fail "107.2: CWD not set. Expected '$dirName'. Got:`n$cap"
@@ -132,17 +134,17 @@ try {
 
     Start-Process -FilePath $PSMUX -ArgumentList "new-session -d -s $S107" -WindowStyle Hidden
     if (-not (Wait-ForSession $S107)) { Write-Fail "107.3: Session did not start"; throw "skip" }
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds 1500
 
     & $PSMUX new-window -c $testDir -t $S107 2>&1 | Out-Null
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     & $PSMUX send-keys -t $S107 "pwd" Enter
     Start-Sleep -Seconds 2
     $cap = Capture-Pane $S107
     $dirName = Split-Path $testDir -Leaf
 
-    if ($cap -match [regex]::Escape($dirName)) {
+    if (($cap -replace "`r?`n", "") -match [regex]::Escape($dirName)) {
         Write-Pass "107.3: new-window -c sets CWD (found $dirName)"
     } else {
         Write-Fail "107.3: CWD not set. Expected '$dirName'. Got:`n$cap"
@@ -162,16 +164,16 @@ try {
 
     Start-Process -FilePath $PSMUX -ArgumentList "new-session -d -s $S107" -WindowStyle Hidden
     if (-not (Wait-ForSession $S107)) { Write-Fail "107.4: Session did not start"; throw "skip" }
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds 1500
 
     # Exact Claude Code teammate spawn pattern
     $paneId = & $PSMUX split-window -h -d -c $testDir -t $S107 -P -F "#{pane_id}" 2>&1
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     if ($paneId -match '%\d+') {
         # -d means detached — focus stayed on pane 0. Select the new pane.
         & $PSMUX select-pane -t "$S107" -R 2>&1 | Out-Null
-        Start-Sleep -Seconds 3
+        Start-Sleep -Milliseconds 1500
 
         # Use $PWD.Path to avoid pwd truncation in narrow panes
         & $PSMUX send-keys -t $S107 'Write-Output "CWDVAL=$($PWD.Path)"' Enter
@@ -210,7 +212,7 @@ Write-Test "109.1: Session starts cleanly (no GetHistoryItems errors)"
 try {
     Start-Process -FilePath $PSMUX -ArgumentList "new-session -d -s $S109" -WindowStyle Hidden
     if (-not (Wait-ForSession $S109)) { Write-Fail "109.1: Session did not start"; throw "skip" }
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     # Capture the initial pane output — should not contain error text
     $cap = Capture-Pane $S109
@@ -230,7 +232,7 @@ Write-Test "109.2: User profile is sourced inside psmux"
 try {
     Start-Process -FilePath $PSMUX -ArgumentList "new-session -d -s $S109" -WindowStyle Hidden
     if (-not (Wait-ForSession $S109)) { Write-Fail "109.2: Session did not start"; throw "skip" }
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     # Check that $PROFILE variable is set (it always is in pwsh)
     & $PSMUX send-keys -t $S109 'Write-Output "PROFILE_PATH=$PROFILE"' Enter
@@ -255,7 +257,7 @@ Write-Test "109.3: PSReadLine predictions are disabled"
 try {
     Start-Process -FilePath $PSMUX -ArgumentList "new-session -d -s $S109" -WindowStyle Hidden
     if (-not (Wait-ForSession $S109)) { Write-Fail "109.3: Session did not start"; throw "skip" }
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     & $PSMUX send-keys -t $S109 '(Get-PSReadLineOption).PredictionSource' Enter
     Start-Sleep -Seconds 2
@@ -280,10 +282,10 @@ Write-Test "109.4: Split pane starts without PSReadLine errors"
 try {
     Start-Process -FilePath $PSMUX -ArgumentList "new-session -d -s $S109" -WindowStyle Hidden
     if (-not (Wait-ForSession $S109)) { Write-Fail "109.4: Session did not start"; throw "skip" }
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds 1500
 
     & $PSMUX split-window -h -t $S109 2>&1 | Out-Null
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     $cap = Capture-Pane $S109
     if ($cap -match "GetHistoryItems|NullReferenceException|MethodInvocationException") {
@@ -391,7 +393,7 @@ Write-Test "110.4: Environment variable propagates to new split pane"
 try {
     Start-Process -FilePath $PSMUX -ArgumentList "new-session -d -s $S110" -WindowStyle Hidden
     if (-not (Wait-ForSession $S110)) { Write-Fail "110.4: Session did not start"; throw "skip" }
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds 1500
 
     # Set a variable AFTER session is created
     & $PSMUX set-environment -t $S110 PSMUX_PROPAGATE_TEST "propagated_ok" 2>&1 | Out-Null
@@ -399,7 +401,7 @@ try {
 
     # Create a new split pane — it should inherit the variable
     & $PSMUX split-window -h -t $S110 2>&1 | Out-Null
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     # Check if the new pane has the env var
     & $PSMUX send-keys -t $S110 'Write-Output "ENVVAL=$env:PSMUX_PROPAGATE_TEST"' Enter
@@ -422,7 +424,7 @@ Write-Test "110.5: Unset variable does NOT propagate to new panes"
 try {
     Start-Process -FilePath $PSMUX -ArgumentList "new-session -d -s $S110" -WindowStyle Hidden
     if (-not (Wait-ForSession $S110)) { Write-Fail "110.5: Session did not start"; throw "skip" }
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds 1500
 
     # Set then unset
     & $PSMUX set-environment -t $S110 PSMUX_UNSET_PROP "should_vanish" 2>&1 | Out-Null
@@ -432,7 +434,7 @@ try {
 
     # Create a new split — should NOT have the variable
     & $PSMUX split-window -h -t $S110 2>&1 | Out-Null
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     & $PSMUX send-keys -t $S110 'Write-Output "UVAL=[$env:PSMUX_UNSET_PROP]"' Enter
     Start-Sleep -Seconds 2
@@ -454,7 +456,7 @@ Write-Test "110.6: Unset CLAUDECODE prevents poisoning new panes"
 try {
     Start-Process -FilePath $PSMUX -ArgumentList "new-session -d -s $S110" -WindowStyle Hidden
     if (-not (Wait-ForSession $S110)) { Write-Fail "110.6: Session did not start"; throw "skip" }
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds 1500
 
     # Simulate: server was started from a Claude Code session
     & $PSMUX set-environment -t $S110 CLAUDECODE "1" 2>&1 | Out-Null
@@ -466,7 +468,7 @@ try {
 
     # New pane should not have CLAUDECODE
     & $PSMUX split-window -h -t $S110 2>&1 | Out-Null
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     & $PSMUX send-keys -t $S110 'Write-Output "CC=[$env:CLAUDECODE]"' Enter
     Start-Sleep -Seconds 2
@@ -501,7 +503,7 @@ try {
 
     # Create a new window with cmd.exe
     & $PSMUX split-window -h -t $SCOMPAT "cmd.exe /K echo CMD_ALIVE" 2>&1 | Out-Null
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds 1500
 
     $cap = Capture-Pane $SCOMPAT
     if ($cap -match "CMD_ALIVE") {
@@ -535,7 +537,7 @@ try {
 
     # Use split-window to open bash, then send-keys to echo
     & $PSMUX split-window -h -t $SCOMPAT "$gitBash" 2>&1 | Out-Null
-    Start-Sleep -Seconds 3
+    Start-Sleep -Milliseconds 1500
 
     & $PSMUX send-keys -t $SCOMPAT "echo BASH_ALIVE" Enter
     Start-Sleep -Seconds 2
@@ -571,8 +573,13 @@ try {
     Start-Sleep -Seconds 8
 
     & $PSMUX send-keys -t $SCOMPAT "echo WSL_ALIVE" Enter
-    Start-Sleep -Seconds 3
-    $cap = Capture-Pane $SCOMPAT
+    $swWsl = [System.Diagnostics.Stopwatch]::StartNew()
+    $cap = ""
+    while ($swWsl.ElapsedMilliseconds -lt 10000) {
+        $cap = Capture-Pane $SCOMPAT
+        if ($cap -match "WSL_ALIVE") { break }
+        Start-Sleep -Milliseconds 500
+    }
     if ($cap -match "WSL_ALIVE") {
         Write-Pass "COMPAT.3: WSL pane works"
     } else {
@@ -589,7 +596,7 @@ Write-Test "COMPAT.4: pwsh session works normally"
 try {
     Start-Process -FilePath $PSMUX -ArgumentList "new-session -d -s $SCOMPAT" -WindowStyle Hidden
     if (-not (Wait-ForSession $SCOMPAT)) { Write-Fail "COMPAT.4: Session did not start"; throw "skip" }
-    Start-Sleep -Seconds 4
+    Start-Sleep -Seconds 2
 
     & $PSMUX send-keys -t $SCOMPAT 'Write-Output "PWSH_ALIVE"' Enter
     Start-Sleep -Seconds 2

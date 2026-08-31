@@ -1,5 +1,5 @@
 use super::should_spawn_warm_server;
-use super::helpers::combined_data_version;
+use super::helpers::{combined_data_version, list_windows_json_with_tabs};
 use crate::types::AppState;
 
 // ── Hook set/replace/unset tests (issue #133) ───────────────────
@@ -140,6 +140,40 @@ fn get_option_allow_rename() {
     let app = AppState::new("test".to_string());
     let val = super::options::get_option_value(&app, "allow-rename");
     assert_eq!(val, "on");
+}
+
+#[test]
+fn warm_server_does_not_run_status_interval_timer() {
+    // Guards the double-fire fix; see AppState::should_run_status_interval_timer.
+    let mut app = AppState::new("__warm__".to_string());
+    app.status_interval = 5;
+    assert!(
+        !app.should_run_status_interval_timer(),
+        "warm server must not run the status-interval timer"
+    );
+
+    app.session_name = "main".to_string();
+    assert!(
+        app.should_run_status_interval_timer(),
+        "a real session must run the status-interval timer"
+    );
+
+    app.status_interval = 0;
+    assert!(
+        !app.should_run_status_interval_timer(),
+        "status-interval=0 disables the timer"
+    );
+}
+
+#[test]
+fn is_warm_server_tracks_the_reserved_name() {
+    // Guards the double-fire fix; see AppState::is_warm_server.
+    let mut app = AppState::new("__warm__".to_string());
+    assert!(app.is_warm_server(), "the __warm__ pre-spawn server is warm");
+
+    // Claiming a warm server renames it to the real session; it is no longer warm.
+    app.session_name = "main".to_string();
+    assert!(!app.is_warm_server(), "a claimed/real session is not warm");
 }
 
 #[test]
@@ -285,6 +319,32 @@ fn normalize_only_strips_shift_from_char() {
     assert_eq!(shift_bs, (KeyCode::Backspace, KeyModifiers::SHIFT));
 }
 
+#[test]
+fn bind_key_select_pane_z_stays_as_command() {
+    let mut app = AppState::new("test".to_string());
+    crate::config::parse_bind_key(&mut app, "bind-key -n C-h select-pane -Z -L");
+    let root = app.key_tables.get("root").expect("root table should exist");
+    let bind = &root[0];
+    assert!(matches!(&bind.action, crate::types::Action::Command(cmd) if cmd == "select-pane -Z -L"));
+}
+
+#[test]
+fn parse_config_line_select_pane_z_stays_as_command() {
+    let mut app = AppState::new("test".to_string());
+    crate::config::parse_config_line(&mut app, "bind-key -r h select-pane -Z -L");
+    let prefix = app.key_tables.get("prefix").expect("prefix table should exist");
+    let bind = prefix.iter().find(|b| matches!(b.key.0, KeyCode::Char('h'))).expect("h binding should exist");
+    assert!(matches!(&bind.action, crate::types::Action::Command(cmd) if cmd == "select-pane -Z -L"));
+}
+
+#[test]
+fn serialized_bindings_preserve_select_pane_z_command() {
+    let mut app = AppState::new("test".to_string());
+    crate::config::parse_config_line(&mut app, "bind-key -r h select-pane -Z -L");
+    let json = crate::server::helpers::serialize_bindings_json(&app);
+    assert!(json.contains("select-pane -Z -L"));
+}
+
 // ── combined_data_version includes copy mode state (issue #152) ──
 
 #[test]
@@ -339,4 +399,129 @@ fn combined_data_version_stable_when_copy_state_unchanged() {
     let v1 = combined_data_version(&app);
     let v2 = combined_data_version(&app);
     assert_eq!(v1, v2, "version must be stable when nothing changes");
+}
+
+// ── Bell forwarding tests ───────────────────────────────────────
+
+#[test]
+fn bell_forward_defaults_to_false() {
+    let app = AppState::new("test".to_string());
+    assert!(!app.bell_forward, "bell_forward must default to false");
+}
+
+#[test]
+fn bell_action_none_suppresses_bell_forward() {
+    let mut app = AppState::new("test".to_string());
+    crate::config::parse_config_line(&mut app, "set -g bell-action none");
+    assert_eq!(app.bell_action, "none");
+    // With bell-action none, check_window_activity should never set bell_forward
+    // (no panes to trigger, but verify the option is accepted)
+    let hooks = super::helpers::check_window_activity(&mut app);
+    assert!(!app.bell_forward, "bell_forward must stay false with bell-action none");
+    assert!(hooks.is_empty());
+}
+
+#[test]
+fn bell_action_set_to_any_via_config() {
+    let mut app = AppState::new("test".to_string());
+    crate::config::parse_config_line(&mut app, "set -g bell-action any");
+    assert_eq!(app.bell_action, "any");
+}
+
+#[test]
+fn bell_action_set_to_current_via_config() {
+    let mut app = AppState::new("test".to_string());
+    crate::config::parse_config_line(&mut app, "set -g bell-action current");
+    assert_eq!(app.bell_action, "current");
+}
+
+#[test]
+fn bell_action_set_to_other_via_config() {
+    let mut app = AppState::new("test".to_string());
+    crate::config::parse_config_line(&mut app, "set -g bell-action other");
+    assert_eq!(app.bell_action, "other");
+}
+
+// ── Issue #125: window_zoomed_flag status bar caching ───────────
+
+fn mock_window_for_server(name: &str) -> crate::types::Window {
+    crate::types::Window {
+        root: crate::types::Node::Split {
+            kind: crate::types::LayoutKind::Horizontal,
+            sizes: vec![],
+            children: vec![],
+        },
+        active_path: vec![],
+        name: name.to_string(),
+        id: 0,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
+        activity_flag: false,
+        bell_flag: false,
+        silence_flag: false,
+        last_output_time: std::time::Instant::now(),
+        last_seen_version: 0,
+        manual_rename: false,
+        layout_index: 0,
+        pane_mru: vec![],
+        zoom_saved: None,
+        linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
+    }
+}
+
+#[test]
+fn list_windows_tab_text_reflects_zoom_flag() {
+    // Simulates the core issue #125 bug: after zoom toggle, the
+    // server must re-expand window-status-format so that
+    // #{?window_zoomed_flag,+, } updates in the status bar.
+    // If list_windows_json_with_tabs is not called (because meta_dirty
+    // is not set), the client receives stale tab_text.
+    let mut app = AppState::new("test".to_string());
+    app.window_status_current_format = "#W #{?window_zoomed_flag,+, }".to_string();
+    app.window_status_format = "#W #{?window_zoomed_flag,+, }".to_string();
+    let mut win0 = mock_window_for_server("editor");
+    win0.id = 0;
+    app.windows.push(win0);
+    app.active_idx = 0;
+
+    // Before zoom: tab_text should NOT contain +
+    let json_before = list_windows_json_with_tabs(&app).unwrap();
+    assert!(json_before.contains("editor  ") || !json_before.contains("editor +"),
+        "before zoom, tab_text should not show +, got: {}", json_before);
+
+    // Simulate zoom toggle
+    app.windows[0].zoom_saved = Some(vec![(vec![], vec![50, 50])]);
+
+    // After zoom: tab_text MUST contain + (this only happens if
+    // list_windows_json_with_tabs is actually re-called, which
+    // requires meta_dirty = true in the server loop)
+    let json_after = list_windows_json_with_tabs(&app).unwrap();
+    assert!(json_after.contains("editor +"),
+        "after zoom, tab_text must show +, got: {}", json_after);
+}
+
+#[test]
+fn list_windows_tab_text_per_window_zoom() {
+    // Multi-window scenario from issue #125 follow-up:
+    // zoom window 0, switch to window 1 — window 0 must keep +
+    let mut app = AppState::new("test".to_string());
+    app.window_status_current_format = "#I #W #{?window_zoomed_flag,+, }".to_string();
+    app.window_status_format = "#I #W #{?window_zoomed_flag,+, }".to_string();
+    let mut win0 = mock_window_for_server("editor");
+    win0.id = 0;
+    win0.zoom_saved = Some(vec![(vec![], vec![50, 50])]);
+    let mut win1 = mock_window_for_server("shell");
+    win1.id = 1;
+    app.windows.push(win0);
+    app.windows.push(win1);
+    // Active window is 1 (user switched away from zoomed window 0)
+    app.active_idx = 1;
+
+    let json = list_windows_json_with_tabs(&app).unwrap();
+    // Window 0 (zoomed) should show +
+    assert!(json.contains("editor +"), "zoomed window 0 must show +, got: {}", json);
+    // Window 1 (not zoomed) should show space, not +
+    assert!(!json.contains("shell +"), "non-zoomed window 1 must not show +, got: {}", json);
 }

@@ -101,6 +101,16 @@ pub trait MasterPty: Downcast + Send {
     /// It is invalid to take the writer more than once.
     fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, Error>;
 
+    /// Whether this is a ConPTY created with passthrough mode enabled.
+    ///
+    /// `None` means that the pty implementation is not ConPTY, or does not
+    /// expose this implementation-specific detail.  The result should be
+    /// queried after spawning a child: ConPTY can fall back to a newly-created
+    /// non-passthrough console when process creation rejects passthrough mode.
+    fn conpty_passthrough_mode(&self) -> Option<bool> {
+        None
+    }
+
     /// If applicable to the type of the tty, return the local process id
     /// of the process group or session leader
     #[cfg(unix)]
@@ -124,6 +134,18 @@ pub trait MasterPty: Downcast + Send {
     }
 }
 impl_downcast!(MasterPty);
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_conpty_master_reports_no_passthrough_mode() {
+        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
+
+        assert_eq!(pair.master.conpty_passthrough_mode(), None);
+    }
+}
 
 /// Represents a child process spawned into the pty.
 /// This handle can be used to wait for or terminate that child process.
@@ -270,10 +292,7 @@ impl_downcast!(PtySystem);
 
 impl Child for std::process::Child {
     fn try_wait(&mut self) -> IoResult<Option<ExitStatus>> {
-        std::process::Child::try_wait(self).map(|s| match s {
-            Some(s) => Some(s.into()),
-            None => None,
-        })
+        std::process::Child::try_wait(self).map(|status| status.map(Into::into))
     }
 
     fn wait(&mut self) -> IoResult<ExitStatus> {
@@ -399,6 +418,23 @@ impl ChildKiller for std::process::Child {
 
 pub fn native_pty_system() -> Box<dyn PtySystem + Send> {
     Box::new(NativePtySystem::default())
+}
+
+/// Serializes process-global console identity changes against ConPTY spawns.
+///
+/// On Windows, FreeConsole/AttachConsole swap the whole process's console
+/// connection and its std handle slots.  CreateProcessW for a ConPTY child
+/// (bInheritHandles=FALSE, no STARTF_USESTDHANDLES) stamps the parent's
+/// std handle *values* into the child's ProcessParameters at that instant;
+/// a spawn landing inside another thread's FreeConsole/AttachConsole window
+/// gives the child freed, recycled handle values and the shell dies at its
+/// first console read (psmux issue #450).  Every FreeConsole/AttachConsole
+/// dance and every ConPTY spawn must hold this lock.
+pub fn console_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A panic while holding the lock leaves console state possibly odd but
+    // the lock itself must keep working (see psmux issue #446).
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(unix)]

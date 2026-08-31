@@ -5,6 +5,12 @@
 
 use super::*;
 
+use std::io::{Read, Write as IoWrite};
+use std::net::TcpListener;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+
 fn mock_app() -> AppState {
     let mut app = AppState::new("test_session".to_string());
     app.window_base_index = 0;
@@ -18,6 +24,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -27,6 +35,9 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         layout_index: 0,
         pane_mru: vec![],
         zoom_saved: None,
+        linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -44,6 +55,34 @@ fn mock_app_with_windows(names: &[&str]) -> AppState {
     app
 }
 
+fn capture_control_request() -> (u16, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut request = Vec::new();
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut seen_lf = 0;
+            let mut buf = [0u8; 1];
+            while seen_lf < 2 {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        request.push(buf[0]);
+                        if buf[0] == b'\n' {
+                            seen_lf += 1;
+                        }
+                    }
+                }
+            }
+            let _ = stream.write_all(b"OK\n");
+            let _ = stream.flush();
+        }
+        let _ = tx.send(String::from_utf8_lossy(&request).to_string());
+    });
+    (port, rx)
+}
+
 /// Extract popup output text, panicking with context if not PopupMode.
 fn extract_popup(app: &AppState) -> (&str, &str) {
     match &app.mode {
@@ -55,7 +94,7 @@ fn extract_popup(app: &AppState) -> (&str, &str) {
 /// Extract status message text, panicking if not set.
 fn extract_status_message(app: &AppState) -> &str {
     match &app.status_message {
-        Some((msg, _)) => msg.as_str(),
+        Some((msg, ..)) => msg.as_str(),
         None => panic!("expected status_message to be set"),
     }
 }
@@ -87,6 +126,20 @@ fn display_alias_works() {
     execute_command_string(&mut app, "display test_alias").unwrap();
     let msg = extract_status_message(&app);
     assert_eq!(msg, "test_alias");
+}
+
+#[test]
+fn new_window_forwards_full_command_to_control_port() {
+    let command = r#"new-window -n 'Foo Bar' -c 'D:\x y' 'clod --resume=abc 123'"#;
+    let (port, request_rx) = capture_control_request();
+    let mut app = mock_app_with_window();
+    app.control_port = Some(port);
+    app.session_key = "test-key".to_string();
+
+    execute_command_string(&mut app, command).unwrap();
+
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(request, format!("AUTH test-key\n{}\n", command));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -258,21 +311,35 @@ fn findw_alias_works() {
 
 #[test]
 fn move_window_changes_position() {
+    // `-t` names a display INDEX, and tmux refuses one another window already
+    // holds. Verified on tmux 3.4 with 0:first* 1:second 2:third:
+    //   move-window -t 2  ->  rc 1, "index in use: 2", list unchanged
+    //   move-window -t 5  ->  rc 0, 1:second 2:third 5:first*
+    // This used to splice the Vec instead, which produced an order tmux never
+    // produces for any layout with a gap (issue #602).
     let mut app = mock_app_with_windows(&["first", "second", "third"]);
     app.active_idx = 0; // "first" is active
     execute_command_string(&mut app, "move-window -t 2").unwrap();
-    // After move, "first" should now be at position 1 (moved toward index 2)
     let names: Vec<&str> = app.windows.iter().map(|w| w.name.as_str()).collect();
-    assert_eq!(names[0], "second", "second should be at 0 after move");
-    assert!(names.contains(&"first"), "first should still exist");
+    assert_eq!(names, vec!["first", "second", "third"],
+        "an occupied destination is refused, so nothing moves");
+
+    execute_command_string(&mut app, "move-window -t 5").unwrap();
+    let names: Vec<&str> = app.windows.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, vec!["second", "third", "first"], "first moved to index 5");
+    assert_eq!(app.window_indices, vec![1, 2, 5]);
+    assert_eq!(app.windows[app.active_idx].name, "first",
+        "without -d the moved window stays current");
 }
 
 #[test]
 fn movew_alias_works() {
     let mut app = mock_app_with_windows(&["a", "b", "c"]);
     app.active_idx = 2;
-    execute_command_string(&mut app, "movew -t 0").unwrap();
-    assert_eq!(app.windows[0].name, "c", "moving window 2 to position 0");
+    execute_command_string(&mut app, "movew -t 7").unwrap();
+    assert_eq!(app.window_indices, vec![0, 1, 7], "c took index 7");
+    assert_eq!(app.windows[2].name, "c");
+    assert_eq!(app.windows[app.active_idx].name, "c");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -311,19 +378,18 @@ fn swap_window_same_index_is_noop() {
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn link_window_shows_not_supported_message() {
+fn link_window_accepted() {
     let mut app = mock_app_with_window();
+    // link-window is now functional; in mock context (no PTY system),
+    // the command is accepted without error
     execute_command_string(&mut app, "link-window -t 0").unwrap();
-    let msg = extract_status_message(&app);
-    assert!(msg.contains("not supported"), "link-window should show not-supported message, got: {}", msg);
 }
 
 #[test]
-fn linkw_alias_shows_same_message() {
+fn linkw_alias_accepted() {
     let mut app = mock_app_with_window();
+    // linkw alias is also accepted without error
     execute_command_string(&mut app, "linkw").unwrap();
-    let msg = extract_status_message(&app);
-    assert!(msg.contains("not supported"));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -412,7 +478,7 @@ fn choose_client_shows_single_client_message() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  customize-mode: shows options (non-empty fallback)
+//  customize-mode: interactive options editor
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -420,12 +486,11 @@ fn customize_mode_shows_options_popup() {
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "customize-mode").unwrap();
     match &app.mode {
-        Mode::PopupMode { command, output, .. } => {
-            assert!(command.contains("customize"), "command should reference customize-mode");
-            assert!(output.contains("mouse"), "should display options including mouse");
-            assert!(output.contains("prefix"), "should display options including prefix");
+        Mode::CustomizeMode { options, .. } => {
+            assert!(options.iter().any(|(n, _, _)| n == "mouse"), "should display options including mouse");
+            assert!(options.iter().any(|(n, _, _)| n == "prefix"), "should display options including prefix");
         }
-        other => panic!("expected PopupMode for customize-mode, got {:?}", std::mem::discriminant(other)),
+        other => panic!("expected CustomizeMode for customize-mode, got {:?}", std::mem::discriminant(other)),
     }
 }
 
@@ -576,6 +641,55 @@ fn if_shell_literal_false_runs_false_cmd() {
     execute_command_string(&mut app, "if-shell false next-window previous-window").unwrap();
     // "false" condition: runs previous-window, which wraps from 0 to 1
     assert_eq!(app.active_idx, 1, "condition 'false' should run the false command");
+}
+
+// Regression: #183 — if-shell -F must expand format variables before truthiness check
+#[test]
+fn if_shell_format_expands_user_option_truthy() {
+    let mut app = mock_app_with_windows(&["a", "b", "c"]);
+    app.active_idx = 0;
+    // Set @pane-is-vim to "1" (truthy)
+    app.user_options.insert("@pane-is-vim".to_string(), "1".to_string());
+    // The format string #{@pane-is-vim} must be expanded to "1" before evaluation
+    execute_command_string(&mut app, r##"if-shell -F "#{@pane-is-vim}" next-window previous-window"##).unwrap();
+    assert_eq!(app.active_idx, 1, "@pane-is-vim=1 should expand to truthy, running next-window");
+}
+
+#[test]
+fn if_shell_format_expands_user_option_falsy() {
+    let mut app = mock_app_with_windows(&["a", "b", "c"]);
+    app.active_idx = 1;
+    // Set @pane-is-vim to "0" (falsy)
+    app.user_options.insert("@pane-is-vim".to_string(), "0".to_string());
+    execute_command_string(&mut app, r##"if-shell -F "#{@pane-is-vim}" next-window previous-window"##).unwrap();
+    assert_eq!(app.active_idx, 0, "@pane-is-vim=0 should expand to falsy, running previous-window");
+}
+
+#[test]
+fn if_shell_format_expands_unset_option_as_falsy() {
+    let mut app = mock_app_with_windows(&["a", "b", "c"]);
+    app.active_idx = 1;
+    // @pane-is-vim is NOT set, so #{@pane-is-vim} should expand to "" (empty = falsy)
+    execute_command_string(&mut app, r##"if-shell -F "#{@pane-is-vim}" next-window previous-window"##).unwrap();
+    assert_eq!(app.active_idx, 0, "unset @pane-is-vim should expand to empty (falsy), running previous-window");
+}
+
+#[test]
+fn if_shell_format_expands_session_name() {
+    let mut app = mock_app_with_windows(&["a", "b", "c"]);
+    app.active_idx = 0;
+    // #{session_name} is always non-empty ("test_session"), so true branch should run
+    execute_command_string(&mut app, r##"if-shell -F "#{session_name}" next-window previous-window"##).unwrap();
+    assert_eq!(app.active_idx, 1, "session_name should expand to non-empty truthy value");
+}
+
+#[test]
+fn if_shell_format_expands_window_zoomed_flag() {
+    let mut app = mock_app_with_windows(&["a", "b", "c"]);
+    app.active_idx = 1;
+    // window_zoomed_flag is 0 when not zoomed, should be falsy
+    execute_command_string(&mut app, r##"if-shell -F "#{window_zoomed_flag}" next-window previous-window"##).unwrap();
+    assert_eq!(app.active_idx, 0, "window_zoomed_flag=0 (not zoomed) should be falsy");
 }
 
 // ════════════════════════════════════════════════════════════════════════════

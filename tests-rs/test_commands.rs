@@ -17,6 +17,8 @@ fn test_generate_list_clients() {
         active_path: vec![],
         name: "shell".to_string(),
         id: 0,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -26,6 +28,9 @@ fn test_generate_list_clients() {
         layout_index: 0,
         pane_mru: vec![],
         zoom_saved: None,
+        linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     };
     app.windows.push(win);
     let output = generate_list_clients(&app);
@@ -80,6 +85,8 @@ fn mock_app_with_window() -> AppState {
         active_path: vec![],
         name: "shell".to_string(),
         id: 0,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -89,8 +96,12 @@ fn mock_app_with_window() -> AppState {
         layout_index: 0,
         pane_mru: vec![],
         zoom_saved: None,
+        linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     };
     app.windows.push(win);
+
     app
 }
 

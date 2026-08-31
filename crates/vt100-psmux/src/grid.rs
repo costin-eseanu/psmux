@@ -13,6 +13,12 @@ pub struct Grid {
     scrollback: std::collections::VecDeque<crate::row::Row>,
     scrollback_len: usize,
     scrollback_offset: usize,
+    /// Copy-mode freeze (psmux issue #494): when set, the visible region is
+    /// anchored to its current content even at `scrollback_offset == 0` —
+    /// rows pushed into scrollback bump the offset so the view does not
+    /// follow new output, matching tmux's frozen copy-mode screen.  (At
+    /// offset > 0 this anchoring always happens, frozen or not.)
+    frozen: bool,
 }
 
 impl Grid {
@@ -29,7 +35,16 @@ impl Grid {
             scrollback: std::collections::VecDeque::new(),
             scrollback_len,
             scrollback_offset: 0,
+            frozen: false,
         }
+    }
+
+    pub fn frozen(&self) -> bool {
+        self.frozen
+    }
+
+    pub fn set_frozen(&mut self, frozen: bool) {
+        self.frozen = frozen;
     }
 
     pub fn allocate_rows(&mut self) {
@@ -197,6 +212,42 @@ impl Grid {
 
     pub fn set_scrollback(&mut self, rows: usize) {
         self.scrollback_offset = rows.min(self.scrollback.len());
+    }
+
+    /// Returns the number of rows currently held in the scrollback buffer
+    /// (distinct from `scrollback_len`, which is the configured maximum).
+    pub fn scrollback_filled(&self) -> usize {
+        self.scrollback.len()
+    }
+
+    /// Updates the scrollback buffer's maximum size.  When `new_len` is
+    /// smaller than the current fill, the oldest rows are trimmed away.
+    pub fn set_scrollback_len(&mut self, new_len: usize) {
+        self.scrollback_len = new_len;
+        while self.scrollback.len() > self.scrollback_len {
+            self.scrollback.pop_front();
+        }
+        if self.scrollback_offset > self.scrollback.len() {
+            self.scrollback_offset = self.scrollback.len();
+        }
+    }
+
+    /// Append a row to the back of scrollback, evicting the oldest if
+    /// the cap is reached.  Used by the alt-screen-to-scrollback copy
+    /// path (psmux issue #88).  Honours `scrollback_len = 0` (no-op),
+    /// matching how the normal in-flow scrolling treats that case.
+    pub fn push_row_to_scrollback(&mut self, row: crate::row::Row) {
+        if self.scrollback_len == 0 {
+            return;
+        }
+        self.scrollback.push_back(row);
+        while self.scrollback.len() > self.scrollback_len {
+            self.scrollback.pop_front();
+        }
+        if self.scrollback_offset > 0 || self.frozen {
+            self.scrollback_offset =
+                self.scrollback.len().min(self.scrollback_offset + 1);
+        }
     }
 
     pub fn write_contents(&self, contents: &mut String) {
@@ -573,7 +624,7 @@ impl Grid {
                 while self.scrollback.len() > self.scrollback_len {
                     self.scrollback.pop_front();
                 }
-                if self.scrollback_offset > 0 {
+                if self.scrollback_offset > 0 || self.frozen {
                     self.scrollback_offset =
                         self.scrollback.len().min(self.scrollback_offset + 1);
                 }
@@ -681,7 +732,11 @@ impl Grid {
     }
 
     pub fn col_wrap(&mut self, width: u16, wrap: bool) {
-        if self.pos.col > self.size.cols - width {
+        // `cols - width` underflows for a glyph wider than the row, which a
+        // pane shrunk to one column produces (#534). Screen::text drops such a
+        // glyph before reaching here, but col_wrap is reachable from elsewhere,
+        // so keep the arithmetic safe at the source too.
+        if self.pos.col > self.size.cols.saturating_sub(width) {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);

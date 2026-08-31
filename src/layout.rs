@@ -5,7 +5,6 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::types::{AppState, Node, LayoutKind, Mode};
 use crate::tree::get_split_mut;
-use crate::util::infer_title_from_prompt;
 
 /// Serialize a vt100 screen region into run-length-encoded rows (rows_v2 format).
 ///
@@ -13,6 +12,17 @@ use crate::util::infer_title_from_prompt;
 /// overlay rendering.  Extracts cells from [0..rows) x [0..cols), merges
 /// adjacent cells with identical styling into runs, and returns the result
 /// as a `Vec<RowRunsJson>`.
+/// Extracts the extended underline style and the SGR 58 underline colour from
+/// a parsed cell, in the shape the run JSON carries them (#589).
+fn cell_underline(cell: &vt100::Cell) -> (u8, Option<String>) {
+    let ul = cell.underline_style().sgr_subparam();
+    let ulc = match cell.underline_color() {
+        vt100::Color::Default => None,
+        c => Some(crate::util::color_to_name(c).into_owned()),
+    };
+    (ul, ulc)
+}
+
 pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Vec<RowRunsJson> {
     const FLAG_DIM: u8 = 1;
     const FLAG_BOLD: u8 = 2;
@@ -30,12 +40,14 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
         let mut prev_fg_raw: Option<vt100::Color> = None;
         let mut prev_bg_raw: Option<vt100::Color> = None;
         let mut prev_flags: u8 = 0;
+        let mut prev_link: Option<u32> = None;
         while c < cols {
-            let (width, cell_fg_raw, cell_bg_raw, flags) = if let Some(cell) = screen.cell(r, c) {
+            let (width, cell_fg_raw, cell_bg_raw, flags, cell_link) = if let Some(cell) = screen.cell(r, c) {
                 let t = cell.contents();
                 let t = if t.is_empty() { " " } else { t };
                 let cell_fg = cell.fgcolor();
                 let cell_bg = cell.bgcolor();
+                let cell_link = cell.hyperlink_id();
                 let mut w = UnicodeWidthStr::width(t) as u16;
                 if w == 0 { w = 1; }
                 let mut fl = 0u8;
@@ -47,9 +59,15 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
                 if cell.blink() { fl |= FLAG_BLINK; }
                 if cell.hidden() { fl |= FLAG_HIDDEN; }
                 if cell.strikethrough() { fl |= FLAG_STRIKETHROUGH; }
+                let (cell_ul, cell_ulc) = cell_underline(cell);
 
+                // A hyperlink change must also break the run so the client can
+                // wrap exactly the linked text in OSC 8 (#361).
                 let merged = if let Some(last) = runs.last_mut() {
-                    if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg) && prev_flags == fl {
+                    if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg)
+                        && prev_flags == fl && prev_link == Some(cell_link)
+                        && last.ul == cell_ul && last.ulc == cell_ulc
+                    {
                         last.text.push_str(t);
                         last.width = last.width.saturating_add(w);
                         true
@@ -58,26 +76,32 @@ pub fn serialize_screen_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> Ve
                 if !merged {
                     let fg = crate::util::color_to_name(cell_fg);
                     let bg = crate::util::color_to_name(cell_bg);
-                    runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w });
+                    let link = if cell_link != 0 {
+                        screen.hyperlink_uri(cell_link).map(|s| s.to_string())
+                    } else { None };
+                    runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link, ul: cell_ul, ulc: cell_ulc });
                 }
 
-                (w, cell_fg, cell_bg, fl)
+                (w, cell_fg, cell_bg, fl, cell_link)
             } else {
                 let merged = if let Some(last) = runs.last_mut() {
-                    if prev_fg_raw == Some(vt100::Color::Default) && prev_bg_raw == Some(vt100::Color::Default) && prev_flags == 0 {
+                    if prev_fg_raw == Some(vt100::Color::Default) && prev_bg_raw == Some(vt100::Color::Default)
+                        && prev_flags == 0 && prev_link == Some(0)
+                    {
                         last.text.push(' ');
                         last.width = last.width.saturating_add(1);
                         true
                     } else { false }
                 } else { false };
                 if !merged {
-                    runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1 });
+                    runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None, ul: 0, ulc: None });
                 }
-                (1u16, vt100::Color::Default, vt100::Color::Default, 0u8)
+                (1u16, vt100::Color::Default, vt100::Color::Default, 0u8, 0u32)
             };
             prev_fg_raw = Some(cell_fg_raw);
             prev_bg_raw = Some(cell_bg_raw);
             prev_flags = flags;
+            prev_link = Some(cell_link);
             c = c.saturating_add(width.max(1));
         }
         result.push(RowRunsJson { runs });
@@ -99,24 +123,46 @@ pub fn cycle_top_layout(app: &mut AppState) {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CellJson { pub text: String, pub fg: String, pub bg: String, pub bold: bool, pub italic: bool, pub underline: bool, pub inverse: bool, pub dim: bool, pub blink: bool, pub hidden: bool, pub strikethrough: bool }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CellRunJson {
     pub text: String,
     pub fg: String,
     pub bg: String,
     pub flags: u8,
     pub width: u16,
+    /// OSC 8 hyperlink URI for this run, if any (#361). Omitted from the JSON
+    /// when absent — links are rare, so the per-frame payload is unchanged for
+    /// normal output. The client re-emits OSC 8 around runs that carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    /// Extended underline style for this run as the SGR 4 subparameter:
+    /// 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed (#589).
+    /// `flags & FLAG_UNDERLINE` still says "underlined at all", so an older
+    /// client that does not know this field keeps drawing a plain underline.
+    /// Omitted from the JSON when 0 or 1, which is every ordinary run.
+    #[serde(default, skip_serializing_if = "crate::layout::ul_is_plain")]
+    pub ul: u8,
+    /// SGR 58 underline colour name for this run, if one was set (#589).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ulc: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+/// Runs with no underline or a plain single underline need no `ul` field on
+/// the wire, which keeps the per-frame payload identical for normal output.
+#[must_use]
+pub fn ul_is_plain(ul: &u8) -> bool {
+    *ul <= 1
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct RowRunsJson {
     pub runs: Vec<CellRunJson>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum LayoutJson {
     #[serde(rename = "split")]
@@ -130,6 +176,13 @@ pub enum LayoutJson {
         cursor_col: u16,
         #[serde(default)]
         alternate_screen: bool,
+        /// True when the pane's app EXPLICITLY enabled a mouse protocol
+        /// (DECSET 1000/1002/1003).  Strict on purpose — no alt-screen or
+        /// fullscreen heuristic — so the client only yields its drag
+        /// selection to apps that really consume mouse events; alt-screen
+        /// apps without mouse support (e.g. `less`) keep psmux selection.
+        #[serde(default)]
+        wants_mouse: bool,
         #[serde(default)]
         hide_cursor: bool,
         #[serde(default)]
@@ -137,6 +190,13 @@ pub enum LayoutJson {
         active: bool,
         copy_mode: bool,
         scroll_offset: usize,
+        /// The pane parser's live scrollback offset.  Nonzero whenever the
+        /// view is scrolled back — including DIRECT scrollback with
+        /// scroll-enter-copy-mode off (#193), where copy_mode stays false.
+        /// The client uses it to decide whether a drag selection crossing a
+        /// pane edge has scrollback content to continue into.
+        #[serde(default)]
+        view_offset: usize,
         sel_start_row: Option<u16>,
         sel_start_col: Option<u16>,
         sel_end_row: Option<u16>,
@@ -151,11 +211,104 @@ pub enum LayoutJson {
         content: Vec<Vec<CellJson>>,
         #[serde(default)]
         rows_v2: Vec<RowRunsJson>,
+        /// Pane title for border label expansion
+        #[serde(default)]
+        title: Option<String>,
     },
 }
 
+impl LayoutJson {
+    /// Counts the total number of leaf panes in this layout tree.
+    pub fn count_leaves(&self) -> usize {
+        match self {
+            LayoutJson::Leaf { .. } => 1,
+            LayoutJson::Split { children, .. } => children.iter().map(|c| c.count_leaves()).sum(),
+        }
+    }
+}
+
 pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
+    dump_layout_json_inner(app, None)
+}
+
+/// Same as `dump_layout_json` but for a specific window id, regardless of
+/// which window is currently active. Used by cross-session previews so
+/// every pane in the target window is captured with its own `rows_v2`,
+/// avoiding the ambiguity of `capture-pane -t :@W.%P` (which depends on
+/// transient focus and was returning the active pane's content for every
+/// requested pane id).
+pub fn dump_window_layout_json(app: &mut AppState, win_id: usize) -> io::Result<String> {
+    dump_layout_json_inner(app, Some(win_id))
+}
+
+/// Copy-mode screen freeze (issue #494, tmux parity): while the session is in
+/// copy mode, anchor the ACTIVE pane's parser (`Screen::set_frozen`) so new
+/// output bumps the scrollback offset instead of shifting the rendered view;
+/// release the anchor on every other pane so nothing is left permanently
+/// frozen after copy mode exits or focus moves.  Returns via
+/// `app.copy_scroll_offset` the (possibly auto-bumped) parser offset so
+/// selection math and the client-side scroll indicator stay consistent.
+fn sync_copy_freeze(app: &mut AppState, in_copy_mode: bool) {
+    // `r` (refresh-from-pane, #498) releases the anchor so the pane tracks
+    // live output while copy mode stays open.
+    let in_copy_mode = in_copy_mode && !app.copy_refresh_live;
+    fn walk(node: &mut Node, path: &mut Vec<usize>, target: Option<&[usize]>) -> Option<usize> {
+        let mut synced = None;
+        match node {
+            Node::Split { children, .. } => {
+                for (i, c) in children.iter_mut().enumerate() {
+                    path.push(i);
+                    if let Some(v) = walk(c, path, target) { synced = Some(v); }
+                    path.pop();
+                }
+            }
+            Node::Leaf(p) => {
+                let freeze = target.map_or(false, |t| t == path.as_slice());
+                if let Ok(mut parser) = p.term.lock() {
+                    if parser.screen().frozen() != freeze {
+                        parser.screen_mut().set_frozen(freeze);
+                        if !freeze {
+                            // Leaving the frozen state must return the pane
+                            // to the LIVE view: the freeze auto-bumped the
+                            // parser scrollback offset, and any offset > 0
+                            // keeps anchoring on its own, which would pin
+                            // the view at the copy-mode content forever.
+                            parser.screen_mut().set_scrollback(0);
+                        }
+                    }
+                    if freeze { synced = Some(parser.screen().scrollback()); }
+                }
+            }
+        }
+        synced
+    }
+    let active_idx = app.active_idx;
+    let mut new_offset = None;
+    for (wi, win) in app.windows.iter_mut().enumerate() {
+        // Floating panes render their own live view — never frozen.
+        let target_path = if in_copy_mode && wi == active_idx && win.floating_focus.is_none() {
+            Some(win.active_path.clone())
+        } else {
+            None
+        };
+        let mut path = Vec::new();
+        if let Some(v) = walk(&mut win.root, &mut path, target_path.as_deref()) {
+            new_offset = Some(v);
+        }
+        for fp in win.floating.iter_mut() {
+            if let Ok(mut parser) = fp.pane.term.lock() {
+                if parser.screen().frozen() { parser.screen_mut().set_frozen(false); }
+            }
+        }
+    }
+    if let Some(v) = new_offset { app.copy_scroll_offset = v; }
+}
+
+fn dump_layout_json_inner(app: &mut AppState, win_id_override: Option<usize>) -> io::Result<String> {
     let in_copy_mode = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+    if win_id_override.is_none() {
+        sync_copy_freeze(app, in_copy_mode);
+    }
     let scroll_offset = app.copy_scroll_offset;
     
     fn build(node: &mut Node, cur_path: &mut Vec<usize>, active_path: &[usize], include_full_content: bool) -> LayoutJson {
@@ -198,15 +351,17 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                         return LayoutJson::Leaf {
                             id: p.id, rows: p.last_rows, cols: p.last_cols,
                             cursor_row: 0, cursor_col: 0, alternate_screen: false,
+                            wants_mouse: false,
                             hide_cursor: true,
                             cursor_shape: 0,
                             active: *cur_path == active_path, copy_mode: false,
                             scroll_offset: 0,
+                            view_offset: 0,
                             sel_start_row: None, sel_start_col: None,
                             sel_end_row: None, sel_end_col: None,
                             sel_mode: None,
                             copy_cursor_row: None, copy_cursor_col: None,
-                            content: vec![], rows_v2: vec![],
+                            content: vec![], rows_v2: vec![], title: None,
                         };
                     } else {
                         // Safety timeout expired without sentinel; unsquelch anyway.
@@ -218,15 +373,17 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     return LayoutJson::Leaf {
                         id: p.id, rows: p.last_rows, cols: p.last_cols,
                         cursor_row: 0, cursor_col: 0, alternate_screen: false,
+                        wants_mouse: false,
                         hide_cursor: false,
                         cursor_shape: p.cursor_shape.load(std::sync::atomic::Ordering::Relaxed),
                         active: *cur_path == active_path, copy_mode: false,
                         scroll_offset: 0,
+                        view_offset: 0,
                         sel_start_row: None, sel_start_col: None,
                         sel_end_row: None, sel_end_col: None,
                         sel_mode: None,
                         copy_cursor_row: None, copy_cursor_col: None,
-                        content: vec![], rows_v2: vec![],
+                        content: vec![], rows_v2: vec![], title: None,
                     };
                 };
                 let screen = parser.screen();
@@ -249,23 +406,8 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     }
                     has_content
                 };
-                // Throttle infer_title_from_prompt — expensive scan, only needed for display.
-                // Use a shorter retry interval while the title is still the default placeholder
-                // so the prompt is picked up as soon as the shell renders it.
-                let now = std::time::Instant::now();
-                let has_placeholder_title = p.title.starts_with("pane %");
-                let throttle_ms = if has_placeholder_title { 80 } else { 500 };
-                if now.duration_since(p.last_infer_title).as_millis() >= throttle_ms {
-                    if let Some(t) = infer_title_from_prompt(&screen, p.last_rows, p.last_cols) {
-                        p.title = t;
-                        p.last_infer_title = now;
-                    } else if !has_placeholder_title {
-                        // Already has a real title — maintain the normal throttle
-                        p.last_infer_title = now;
-                    }
-                    // If still a placeholder and inference failed, don't update
-                    // last_infer_title — retry aggressively on the next frame.
-                }
+                let wants_mouse =
+                    screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
                 let need_full_content = include_full_content && *cur_path == active_path;
                 let mut lines: Vec<Vec<CellJson>> = if need_full_content {
                     Vec::with_capacity(p.last_rows as usize)
@@ -286,16 +428,18 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     let mut prev_fg_raw: Option<vt100::Color> = None;
                     let mut prev_bg_raw: Option<vt100::Color> = None;
                     let mut prev_flags: u8 = 0;
+                    let mut prev_link: Option<u32> = None;
                     while c < p.last_cols {
                         // Process each cell inline to avoid per-cell String allocation.
                         // The &str from cell.contents() can only be used inside the
                         // if-let block (borrows from parser), so run-merging happens
                         // here too — push_str(&str) avoids allocation for merged cells.
-                        let (width, cell_fg_raw, cell_bg_raw, flags) = if let Some(cell) = screen.cell(r, c) {
+                        let (width, cell_fg_raw, cell_bg_raw, flags, cell_link) = if let Some(cell) = screen.cell(r, c) {
                             let t = cell.contents();
                             let t = if t.is_empty() { " " } else { t };
                             let cell_fg = cell.fgcolor();
                             let cell_bg = cell.bgcolor();
+                            let cell_link = cell.hyperlink_id();
                             let mut w = UnicodeWidthStr::width(t) as u16;
                             if w == 0 { w = 1; }
                             let mut fl = 0u8;
@@ -307,10 +451,16 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                             if cell.blink() { fl |= FLAG_BLINK; }
                             if cell.hidden() { fl |= FLAG_HIDDEN; }
                             if cell.strikethrough() { fl |= FLAG_STRIKETHROUGH; }
+                            let (cell_ul, cell_ulc) = cell_underline(cell);
 
-                            // Run merging — push &str directly, no String allocation
+                            // Run merging — push &str directly, no String allocation.
+                            // Break on hyperlink change so OSC 8 wraps exactly the
+                            // linked text (#361).
                             let merged = if let Some(last) = runs.last_mut() {
-                                if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg) && prev_flags == fl {
+                                if prev_fg_raw == Some(cell_fg) && prev_bg_raw == Some(cell_bg)
+                                    && prev_flags == fl && prev_link == Some(cell_link)
+                                    && last.ul == cell_ul && last.ulc == cell_ulc
+                                {
                                     last.text.push_str(t);
                                     last.width = last.width.saturating_add(w);
                                     true
@@ -319,7 +469,10 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                             if !merged {
                                 let fg = crate::util::color_to_name(cell_fg);
                                 let bg = crate::util::color_to_name(cell_bg);
-                                runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w });
+                                let link = if cell_link != 0 {
+                                    screen.hyperlink_uri(cell_link).map(|s| s.to_string())
+                                } else { None };
+                                runs.push(CellRunJson { text: t.to_string(), fg: fg.into_owned(), bg: bg.into_owned(), flags: fl, width: w, link, ul: cell_ul, ulc: cell_ulc.clone() });
                             }
 
                             if need_full_content {
@@ -341,18 +494,20 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                                 }
                             }
 
-                            (w, cell_fg, cell_bg, fl)
+                            (w, cell_fg, cell_bg, fl, cell_link)
                         } else {
                             // No cell — default space
                             let merged = if let Some(last) = runs.last_mut() {
-                                if prev_fg_raw == Some(vt100::Color::Default) && prev_bg_raw == Some(vt100::Color::Default) && prev_flags == 0 {
+                                if prev_fg_raw == Some(vt100::Color::Default) && prev_bg_raw == Some(vt100::Color::Default)
+                                    && prev_flags == 0 && prev_link == Some(0)
+                                {
                                     last.text.push(' ');
                                     last.width = last.width.saturating_add(1);
                                     true
                                 } else { false }
                             } else { false };
                             if !merged {
-                                runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1 });
+                                runs.push(CellRunJson { text: " ".to_string(), fg: "default".to_string(), bg: "default".to_string(), flags: 0, width: 1, link: None, ul: 0, ulc: None });
                             }
                             if need_full_content {
                                 row.push(CellJson {
@@ -361,11 +516,12 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                                     blink: false, hidden: false, strikethrough: false,
                                 });
                             }
-                            (1u16, vt100::Color::Default, vt100::Color::Default, 0u8)
+                            (1u16, vt100::Color::Default, vt100::Color::Default, 0u8, 0u32)
                         };
                         prev_fg_raw = Some(cell_fg_raw);
                         prev_bg_raw = Some(cell_bg_raw);
                         prev_flags = flags;
+                        prev_link = Some(cell_link);
                         c = c.saturating_add(width.max(1));
                     }
                     if need_full_content {
@@ -395,11 +551,15 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     cursor_row: cr,
                     cursor_col: cc,
                     alternate_screen,
+                    wants_mouse,
                     hide_cursor: hide_cursor_flag,
                     cursor_shape: p.cursor_shape.load(std::sync::atomic::Ordering::Relaxed),
                     active: false,
-                    copy_mode: false,
+                    // The pane's OWN mode (#607).  `mark_active` overwrites
+                    // this for the focused pane with the live global mode.
+                    copy_mode: p.copy_state.is_some(),
                     scroll_offset: 0,
+                    view_offset: screen.scrollback(),
                     sel_start_row: None,
                     sel_start_col: None,
                     sel_end_row: None,
@@ -409,11 +569,19 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
                     copy_cursor_col: None,
                     content: lines,
                     rows_v2,
+                    title: if p.title.is_empty() { None } else { Some(p.title.clone()) },
                 }
             }
         }
     }
-    let win = &mut app.windows[app.active_idx];
+    let win_idx = match win_id_override {
+        Some(wid) => match app.windows.iter().position(|w| w.id == wid) {
+            Some(i) => i,
+            None => return Err(io::Error::new(io::ErrorKind::NotFound, format!("window @{} not found", wid))),
+        },
+        None => app.active_idx,
+    };
+    let win = &mut app.windows[win_idx];
     let mut path = Vec::new();
     let mut root = build(&mut win.root, &mut path, &win.active_path, in_copy_mode);
     // Mark the active pane and set copy mode info
@@ -486,10 +654,10 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
         &mut root,
         &win.active_path,
         0,
-        in_copy_mode,
+        in_copy_mode && win_id_override.is_none(),
         scroll_offset,
-        app.copy_anchor,
-        app.copy_pos,
+        if win_id_override.is_none() { app.copy_anchor } else { None },
+        if win_id_override.is_none() { app.copy_pos } else { None },
     );
     let s = serde_json::to_string(&root).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("json error: {e}")))?;
     Ok(s)
@@ -501,6 +669,7 @@ pub fn dump_layout_json(app: &mut AppState) -> io::Result<String> {
 /// identical JSON format that the client deserialises into `LayoutJson`.
 pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     let in_copy = matches!(app.mode, Mode::CopyMode | Mode::CopySearch { .. });
+    sync_copy_freeze(app, in_copy);
     let scroll_off = app.copy_scroll_offset;
     let anchor = app.copy_anchor;
     let anchor_scroll = app.copy_anchor_scroll_offset;
@@ -542,12 +711,33 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
     }
 
     /// Close the currently-open run: closing `"` for text, then fg/bg/flags/width, then `}`.
-    fn close_run(fg: vt100::Color, bg: vt100::Color, fl: u8, w: u16, out: &mut String) {
+    #[allow(clippy::too_many_arguments)]
+    fn close_run(fg: vt100::Color, bg: vt100::Color, fl: u8, w: u16, link: Option<&str>, ul: u8, ulc: vt100::Color, out: &mut String) {
         out.push_str("\",\"fg\":\"");
         push_color(fg, out);
         out.push_str("\",\"bg\":\"");
         push_color(bg, out);
-        let _ = std::fmt::Write::write_fmt(out, format_args!("\",\"flags\":{},\"width\":{}}}", fl, w));
+        let _ = std::fmt::Write::write_fmt(out, format_args!("\",\"flags\":{},\"width\":{}", fl, w));
+        // Extended underline style and SGR 58 colour (#589).  Both are omitted
+        // for ordinary runs so the per-frame payload is unchanged, and
+        // `flags & FLAG_UNDERLINE` still carries "underlined at all".
+        if ul > 1 {
+            let _ = std::fmt::Write::write_fmt(out, format_args!(",\"ul\":{}", ul));
+        }
+        if ulc != vt100::Color::Default {
+            out.push_str(",\"ulc\":\"");
+            push_color(ulc, out);
+            out.push('"');
+        }
+        // OSC 8 URI (#361).  The client re-emits hyperlinks only for runs that
+        // carry this field, and `CellRunJson::link` skips serialising when it is
+        // None, so omitting it here silently disabled hyperlinks in every pane.
+        if let Some(uri) = link {
+            out.push_str(",\"link\":\"");
+            json_esc(uri, out);
+            out.push('"');
+        }
+        out.push('}');
     }
 
     // ── recursive tree walker ────────────────────────────────────────
@@ -611,11 +801,13 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 "\"rows\":{},\"cols\":{},",
                                 "\"cursor_row\":0,\"cursor_col\":0,",
                                 "\"alternate_screen\":false,",
+                                "\"wants_mouse\":false,",
                                 "\"hide_cursor\":true,",
                                 "\"cursor_shape\":0,",
                                 "\"active\":{},\"copy_mode\":false,",
                                 "\"scroll_offset\":0,",
-                                "\"rows_v2\":[],\"content\":[]}}"),
+                                "\"view_offset\":0,",
+                                "\"rows_v2\":[],\"content\":[],\"title\":null}}"),
                             p.id, p.last_rows, p.last_cols, is_active,
                         ));
                         return;
@@ -626,18 +818,28 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
 
                 let is_active    = cur_path.as_slice() == active_path;
                 let need_content = in_copy && is_active;
+                // The wire's per-pane `copy_mode` used to be `need_content`,
+                // so it could only ever be true for the focused pane and the
+                // client drew the copy-mode marker on that pane alone.  tmux
+                // draws the marker from each pane's own mode screen
+                // (`window-copy.c` `window_copy_write_line`), so report the
+                // pane's OWN mode here (#607).  Everything the client gates on
+                // `copy_mode && active` is unchanged by this.
+                let pane_in_copy = need_content || p.copy_state.is_some();
 
                 // ── Snapshot cell data under the mutex, then release ──
                 // This minimises the time we block the reader thread (which
                 // also holds p.term's mutex while processing ConPTY output).
                 // Without this, WSL echo gets starved because its output sits
                 // in the ConPTY pipe while we build the JSON string.
-                struct Run { text: String, fg: vt100::Color, bg: vt100::Color, flags: u8, width: u16 }
+                struct Run { text: String, fg: vt100::Color, bg: vt100::Color, flags: u8, width: u16, link: Option<String>, ul: u8, ulc: vt100::Color }
                 struct RowSnap { runs: Vec<Run> }
                 struct CopyCell { text: String, fg: vt100::Color, bg: vt100::Color, bold: bool, italic: bool, underline: bool, inverse: bool, dim: bool, blink: bool, hidden: bool, strikethrough: bool, width: u16 }
                 struct LeafSnap {
                     cr: u16, cc: u16, alt: bool,
+                    wants_mouse: bool,
                     hide_cursor: bool,
+                    view_offset: usize,
                     rows_v2: Vec<RowSnap>,
                     content: Vec<Vec<CopyCell>>,
                 }
@@ -645,11 +847,14 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                 let snap = 'snap: {
                     let parser = match p.term.lock() {
                         Ok(g) => g,
-                        Err(_) => break 'snap LeafSnap { cr: 0, cc: 0, alt: false, hide_cursor: false, rows_v2: vec![], content: vec![] },
+                        Err(_) => break 'snap LeafSnap { cr: 0, cc: 0, alt: false, wants_mouse: false, hide_cursor: false, view_offset: 0, rows_v2: vec![], content: vec![] },
                     };
                     let screen = parser.screen();
                     let (cr, cc) = screen.cursor_position();
                     let hide_cursor = screen.hide_cursor();
+                    // Live scrollback offset — nonzero for a direct-scrolled
+                    // view (#193) even though copy_mode stays false.
+                    let view_offset = screen.scrollback();
 
                     // Alternate-screen heuristic
                     let alt = screen.alternate_screen() || {
@@ -661,20 +866,9 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                             })
                         })
                     };
-
-                    // Throttled title inference — use shorter retry while title is
-                    // still the default placeholder so the prompt is picked up quickly.
-                    let now = std::time::Instant::now();
-                    let has_placeholder_title = p.title.starts_with("pane %");
-                    let throttle_ms = if has_placeholder_title { 80 } else { 500 };
-                    if now.duration_since(p.last_infer_title).as_millis() >= throttle_ms {
-                        if let Some(t) = infer_title_from_prompt(screen, p.last_rows, p.last_cols) {
-                            p.title = t;
-                            p.last_infer_title = now;
-                        } else if !has_placeholder_title {
-                            p.last_infer_title = now;
-                        }
-                    }
+                    // Strict — explicit mouse protocol only (see Leaf field doc).
+                    let wants_mouse =
+                        screen.mouse_protocol_mode() != vt100::MouseProtocolMode::None;
 
                     // Snapshot rows_v2 (run-merged)
                     let mut snap_rows: Vec<RowSnap> = Vec::with_capacity(p.last_rows as usize);
@@ -684,6 +878,9 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         let mut prev_fg: Option<vt100::Color> = None;
                         let mut prev_bg: Option<vt100::Color> = None;
                         let mut prev_fl: u8 = 0;
+                        let mut prev_link: Option<u32> = None;
+                        let mut prev_ul: u8 = 0;
+                        let mut prev_ulc = vt100::Color::Default;
 
                         while c < p.last_cols {
                             if let Some(cell) = screen.cell(r, c) {
@@ -703,33 +900,53 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                                 if cell.hidden()    { fl |= FLAG_HIDDEN; }
                                 if cell.strikethrough() { fl |= FLAG_STRIKETHROUGH; }
 
-                                if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl {
+                                // A hyperlink change must also break the run, so the
+                                // client wraps exactly the linked text in OSC 8 (#361).
+                                let clink = cell.hyperlink_id();
+                                let cul = cell.underline_style().sgr_subparam();
+                                let culc = cell.underline_color();
+                                if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl
+                                    && prev_link == Some(clink)
+                                    && prev_ul == cul && prev_ulc == culc
+                                {
                                     if let Some(last) = runs.last_mut() {
                                         last.text.push_str(t);
                                         last.width += w;
                                     }
                                 } else {
-                                    runs.push(Run { text: t.to_string(), fg: cfg, bg: cbg, flags: fl, width: w });
+                                    let link = if clink != 0 {
+                                        screen.hyperlink_uri(clink).map(|s| s.to_string())
+                                    } else { None };
+                                    runs.push(Run { text: t.to_string(), fg: cfg, bg: cbg, flags: fl, width: w, link, ul: cul, ulc: culc });
                                 }
                                 prev_fg = Some(cfg);
                                 prev_bg = Some(cbg);
                                 prev_fl = fl;
+                                prev_link = Some(clink);
+                                prev_ul = cul;
+                                prev_ulc = culc;
                                 c += w.max(1);
                             } else {
                                 let cfg = vt100::Color::Default;
                                 let cbg = vt100::Color::Default;
                                 let fl  = 0u8;
-                                if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl {
+                                if prev_fg == Some(cfg) && prev_bg == Some(cbg) && prev_fl == fl
+                                    && prev_link == Some(0)
+                                    && prev_ul == 0 && prev_ulc == vt100::Color::Default
+                                {
                                     if let Some(last) = runs.last_mut() {
                                         last.text.push(' ');
                                         last.width += 1;
                                     }
                                 } else {
-                                    runs.push(Run { text: " ".to_string(), fg: cfg, bg: cbg, flags: fl, width: 1 });
+                                    runs.push(Run { text: " ".to_string(), fg: cfg, bg: cbg, flags: fl, width: 1, link: None, ul: 0, ulc: vt100::Color::Default });
                                 }
                                 prev_fg = Some(cfg);
                                 prev_bg = Some(cbg);
                                 prev_fl = fl;
+                                prev_link = Some(0);
+                                prev_ul = 0;
+                                prev_ulc = vt100::Color::Default;
                                 c += 1;
                             }
                         }
@@ -765,7 +982,7 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         }
                     }
 
-                    LeafSnap { cr, cc, alt, hide_cursor, rows_v2: snap_rows, content: snap_content }
+                    LeafSnap { cr, cc, alt, wants_mouse, hide_cursor, view_offset, rows_v2: snap_rows, content: snap_content }
                 };
                 // ── Parser mutex is now RELEASED ──
                 // All JSON string building below happens without holding the lock,
@@ -780,14 +997,16 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         "\"rows\":{},\"cols\":{},",
                         "\"cursor_row\":{},\"cursor_col\":{},",
                         "\"alternate_screen\":{},",
+                        "\"wants_mouse\":{},",
                         "\"hide_cursor\":{},",
                         "\"cursor_shape\":{},",
                         "\"active\":{},\"copy_mode\":{},",
-                        "\"scroll_offset\":{},"),
+                        "\"scroll_offset\":{},",
+                        "\"view_offset\":{},"),
                     p.id, p.last_rows, p.last_cols,
-                    snap.cr, snap.cc, snap.alt, snap.hide_cursor,
+                    snap.cr, snap.cc, snap.alt, snap.wants_mouse, snap.hide_cursor,
                     cs,
-                    is_active, need_content, so,
+                    is_active, pane_in_copy, so, snap.view_offset,
                 ));
 
                 // selection bounds + copy cursor position
@@ -898,11 +1117,18 @@ pub fn dump_layout_json_fast(app: &mut AppState) -> io::Result<String> {
                         if i > 0 { out.push(','); }
                         out.push_str("{\"text\":\"");
                         json_esc(&run.text, out);
-                        close_run(run.fg, run.bg, run.flags, run.width, out);
+                        close_run(run.fg, run.bg, run.flags, run.width, run.link.as_deref(), run.ul, run.ulc, out);
                     }
                     out.push_str("]}");
                 }
-                out.push_str("]}");
+                out.push_str("]");
+                // Append pane title if set
+                if !p.title.is_empty() {
+                    out.push_str(",\"title\":\"");
+                    json_esc(&p.title, out);
+                    out.push('"');
+                }
+                out.push('}');
             }
         }
     }
@@ -1069,127 +1295,187 @@ pub fn cycle_layout_reverse(app: &mut AppState) {
 ///
 /// The `panes` vec provides existing pane nodes to fill the tree leaves.
 /// Returns `None` if parsing fails.
-pub fn parse_tmux_layout_string(layout_str: &str, panes: &mut Vec<Node>) -> Option<Node> {
-    // Skip the 4-hex-char checksum + comma prefix
+/// Parsed layout node from a tmux layout string.
+/// This is a layout descriptor that can be inspected, counted, and applied
+/// to existing panes without requiring pane objects during parsing.
+#[derive(Debug, Clone)]
+pub enum LayoutNode {
+    Leaf { width: u16, height: u16, x: u16, y: u16, pane_id: Option<usize> },
+    Split { kind: LayoutKind, width: u16, height: u16, x: u16, y: u16, children: Vec<LayoutNode> },
+}
+
+impl LayoutNode {
+    /// Count the number of leaf panes in this layout tree.
+    pub fn count_leaves(&self) -> usize {
+        match self {
+            LayoutNode::Leaf { .. } => 1,
+            LayoutNode::Split { children, .. } => children.iter().map(|c| c.count_leaves()).sum(),
+        }
+    }
+
+    fn width(&self) -> u16 {
+        match self { LayoutNode::Leaf { width, .. } | LayoutNode::Split { width, .. } => *width }
+    }
+
+    fn height(&self) -> u16 {
+        match self { LayoutNode::Leaf { height, .. } | LayoutNode::Split { height, .. } => *height }
+    }
+}
+
+/// Parse a tmux layout string into a `LayoutNode` descriptor tree.
+///
+/// Layout string format: `CHECKSUM,WxH,X,Y{...}` or `[...]` or `,PANE_ID`
+/// The 4-hex-digit checksum prefix is skipped.
+pub fn parse_layout_string(layout_str: &str) -> Option<LayoutNode> {
     let s = layout_str.trim();
     if s.len() < 5 { return None; }
-    // Find the first comma after the checksum
-    let after_checksum = s.find(',')? + 1;
-    let body = &s[after_checksum..];
-    
-    let (node, _) = parse_node(body, panes)?;
+    // Validate and skip the 4-hex-char checksum prefix followed by comma.
+    // tmux checksums are exactly 4 hex digits (e.g. "5e08,").
+    let bytes = s.as_bytes();
+    if bytes.len() < 5 || bytes[4] != b',' { return None; }
+    for &b in &bytes[..4] {
+        if !b.is_ascii_hexdigit() { return None; }
+    }
+    let body = &s[5..];
+    let (node, _) = parse_layout_node(body)?;
     Some(node)
 }
 
-/// Parse a single node from position in the string, returns (Node, chars_consumed)
-fn parse_node(s: &str, panes: &mut Vec<Node>) -> Option<(Node, usize)> {
-    // Parse WxH,X,Y first
-    let (_w, _h, consumed_dims) = parse_dimensions(s)?;
+/// Parse a tmux layout string into a Node tree using existing panes.
+///
+/// Parses the layout string into a LayoutNode descriptor, then converts
+/// it to a Node tree by assigning panes from the provided vec in leaf order.
+/// Returns `None` if parsing fails or there aren't enough panes.
+pub fn parse_tmux_layout_string(layout_str: &str, panes: &mut Vec<Node>) -> Option<Node> {
+    let layout = parse_layout_string(layout_str)?;
+    layout_node_to_node(&layout, panes)
+}
+
+/// Convert a LayoutNode descriptor tree into a Node tree,
+/// consuming panes from the vec in left-to-right leaf order.
+fn layout_node_to_node(layout: &LayoutNode, panes: &mut Vec<Node>) -> Option<Node> {
+    match layout {
+        LayoutNode::Leaf { .. } => {
+            if panes.is_empty() { return None; }
+            Some(panes.remove(0))
+        }
+        LayoutNode::Split { kind, children, .. } => {
+            let total_size: u32 = match kind {
+                LayoutKind::Horizontal => children.iter().map(|c| c.width() as u32).sum(),
+                LayoutKind::Vertical => children.iter().map(|c| c.height() as u32).sum(),
+            };
+            let sizes: Vec<u16> = if total_size == 0 {
+                let n = children.len().max(1) as u16;
+                vec![100 / n; children.len()]
+            } else {
+                let mut szs: Vec<u16> = children.iter().map(|c| {
+                    let dim = match kind {
+                        LayoutKind::Horizontal => c.width() as u32,
+                        LayoutKind::Vertical => c.height() as u32,
+                    };
+                    (dim * 100 / total_size) as u16
+                }).collect();
+                let sum: u16 = szs.iter().sum();
+                if sum < 100 { if let Some(last) = szs.last_mut() { *last += 100 - sum; } }
+                szs
+            };
+            let mut nodes = Vec::with_capacity(children.len());
+            for child in children {
+                nodes.push(layout_node_to_node(child, panes)?);
+            }
+            Some(Node::Split { kind: *kind, sizes, children: nodes })
+        }
+    }
+}
+
+/// Parse a single layout node from position in the string, returns (LayoutNode, chars_consumed).
+fn parse_layout_node(s: &str) -> Option<(LayoutNode, usize)> {
+    let (w, h, x, y, consumed_dims) = parse_dimensions(s)?;
     let rest = &s[consumed_dims..];
-    
-    // After dimensions, we have either:
-    // - '{' for horizontal split
-    // - '[' for vertical split  
-    // - ',' followed by pane_id (leaf)
-    // - end of string (leaf with no pane_id)
-    
+
     if rest.starts_with('{') {
-        // Horizontal split
-        let (children, consumed_bracket) = parse_children(&rest[1..], '}', panes)?;
-        let total_w: u32 = children.iter().map(|(cw, _, _)| *cw as u32).sum();
-        let sizes: Vec<u16> = if total_w == 0 {
-            vec![100 / children.len().max(1) as u16; children.len()]
-        } else {
-            let mut szs: Vec<u16> = children.iter().map(|(cw, _, _)| ((*cw as u32) * 100 / total_w) as u16).collect();
-            let sum: u16 = szs.iter().sum();
-            if sum < 100 { if let Some(last) = szs.last_mut() { *last += 100 - sum; } }
-            szs
-        };
-        let nodes: Vec<Node> = children.into_iter().map(|(_, _, n)| n).collect();
+        // Horizontal split (children side-by-side)
+        let (children, consumed_bracket) = parse_layout_children(&rest[1..], '}')?;
         Some((
-            Node::Split { kind: LayoutKind::Horizontal, sizes, children: nodes },
+            LayoutNode::Split { kind: LayoutKind::Horizontal, width: w, height: h, x, y, children },
             consumed_dims + 1 + consumed_bracket,
         ))
     } else if rest.starts_with('[') {
-        // Vertical split
-        let (children, consumed_bracket) = parse_children(&rest[1..], ']', panes)?;
-        let total_h: u32 = children.iter().map(|(_, ch, _)| *ch as u32).sum();
-        let sizes: Vec<u16> = if total_h == 0 {
-            vec![100 / children.len().max(1) as u16; children.len()]
-        } else {
-            let mut szs: Vec<u16> = children.iter().map(|(_, ch, _)| ((*ch as u32) * 100 / total_h) as u16).collect();
-            let sum: u16 = szs.iter().sum();
-            if sum < 100 { if let Some(last) = szs.last_mut() { *last += 100 - sum; } }
-            szs
-        };
-        let nodes: Vec<Node> = children.into_iter().map(|(_, _, n)| n).collect();
+        // Vertical split (children stacked top/bottom)
+        let (children, consumed_bracket) = parse_layout_children(&rest[1..], ']')?;
         Some((
-            Node::Split { kind: LayoutKind::Vertical, sizes, children: nodes },
+            LayoutNode::Split { kind: LayoutKind::Vertical, width: w, height: h, x, y, children },
             consumed_dims + 1 + consumed_bracket,
         ))
     } else {
-        // Leaf node — may have ,pane_id suffix
+        // Leaf node; may have ,pane_id suffix
         let mut extra = 0;
+        let mut pane_id = None;
         if rest.starts_with(',') {
-            // Skip pane_id
             let id_str = &rest[1..];
-            let end = id_str.find(|c: char| c == ',' || c == '{' || c == '[' || c == '}' || c == ']').unwrap_or(id_str.len());
+            let end = id_str.find(|c: char| c == ',' || c == '{' || c == '[' || c == '}' || c == ']')
+                .unwrap_or(id_str.len());
+            pane_id = id_str[..end].parse::<usize>().ok();
             extra = 1 + end;
         }
-        // Consume a pane from the provided vec
-        let leaf = if !panes.is_empty() { panes.remove(0) } else { return None; };
-        Some((leaf, consumed_dims + extra))
+        Some((
+            LayoutNode::Leaf { width: w, height: h, x, y, pane_id },
+            consumed_dims + extra,
+        ))
     }
 }
 
-/// Parse WxH,X,Y — returns (width, height, chars_consumed)
-fn parse_dimensions(s: &str) -> Option<(u16, u16, usize)> {
-    // Parse W (digits)
+/// Parse WxH,X,Y returning (width, height, x, y, chars_consumed).
+fn parse_dimensions(s: &str) -> Option<(u16, u16, u16, u16, usize)> {
     let x_pos = s.find('x')?;
     let w: u16 = s[..x_pos].parse().ok()?;
     let after_x = &s[x_pos + 1..];
-    // Parse H (digits until ',')
     let comma1 = after_x.find(',')?;
     let h: u16 = after_x[..comma1].parse().ok()?;
     let after_h = &after_x[comma1 + 1..];
-    // Parse X (digits until ',')
     let comma2 = after_h.find(',')?;
-    // _x coordinate (skip)
+    let xc: u16 = after_h[..comma2].parse().ok()?;
     let after_xcoord = &after_h[comma2 + 1..];
-    // Parse Y (digits until next non-digit)
     let y_end = after_xcoord.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_xcoord.len());
-    // Total consumed: W + 'x' + H + ',' + X + ',' + Y
+    let yc: u16 = after_xcoord[..y_end].parse().ok()?;
     let total = x_pos + 1 + comma1 + 1 + comma2 + 1 + y_end;
-    Some((w, h, total))
+    Some((w, h, xc, yc, total))
 }
 
-/// Parse comma-separated children inside brackets.
-/// Returns vec of (width, height, Node) and total chars consumed including closing bracket.
-fn parse_children(s: &str, closing: char, panes: &mut Vec<Node>) -> Option<(Vec<(u16, u16, Node)>, usize)> {
+/// Parse comma-separated layout children inside brackets.
+/// Returns vec of LayoutNode and total chars consumed including closing bracket.
+fn parse_layout_children(s: &str, closing: char) -> Option<(Vec<LayoutNode>, usize)> {
     let mut children = Vec::new();
     let mut pos = 0;
-    
+
     loop {
         if pos >= s.len() { return None; }
         if s.as_bytes()[pos] == closing as u8 {
-            pos += 1; // consume closing bracket
+            pos += 1;
             break;
         }
         if !children.is_empty() {
-            // Expect comma separator between children
-            if s.as_bytes()[pos] == b',' {
+            if s.as_bytes().get(pos).copied() == Some(b',') {
                 pos += 1;
             }
         }
-        
-        // Parse child dimensions first to get w,h
         let child_str = &s[pos..];
-        let (cw, ch, _) = parse_dimensions(child_str)?;
-        // Now parse full node
-        let (node, consumed) = parse_node(child_str, panes)?;
-        children.push((cw, ch, node));
+        let (node, consumed) = parse_layout_node(child_str)?;
+        children.push(node);
         pos += consumed;
     }
-    
+
     Some((children, pos))
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_layout.rs"]
+mod test_layout;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue361_serialize_hyperlink.rs"]
+mod test_issue361_serialize_hyperlink;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue361_fastdump_hyperlink.rs"]
+mod test_issue361_fastdump_hyperlink;

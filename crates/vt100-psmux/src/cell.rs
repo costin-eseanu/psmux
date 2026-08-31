@@ -1,6 +1,10 @@
 use unicode_width::UnicodeWidthChar as _;
 
-// chosen to make the size of the cell struct 32 bytes
+// 22 content bytes keep the cell compact; the struct is 44 bytes once the
+// Attrs OSC 8 hyperlink id (u32), the SGR 58 underline colour, the extended
+// underline style and alignment padding are included.  It was 40 before the
+// styled-underscore support (issue #589) added those last two; tmux carries
+// the same pair on every grid_cell (`us` plus the UNDERSCORE_2..5 attr bits).
 const CONTENT_BYTES: usize = 22;
 
 const IS_WIDE: u8 = 0b1000_0000;
@@ -14,7 +18,7 @@ pub struct Cell {
     len: u8,
     attrs: crate::attrs::Attrs,
 }
-const _: () = assert!(std::mem::size_of::<Cell>() == 32);
+const _: () = assert!(std::mem::size_of::<Cell>() == 44);
 
 impl PartialEq<Self> for Cell {
     fn eq(&self, other: &Self) -> bool {
@@ -110,7 +114,7 @@ impl Cell {
         self.len & IS_WIDE_CONTINUATION != 0
     }
 
-    fn set_wide(&mut self, wide: bool) {
+    pub(crate) fn set_wide(&mut self, wide: bool) {
         if wide {
             self.len |= IS_WIDE;
         } else {
@@ -142,6 +146,13 @@ impl Cell {
         self.attrs.bgcolor
     }
 
+    /// Returns the OSC 8 hyperlink id of the cell (0 = no hyperlink). Resolve
+    /// it to a URI via `Screen::hyperlink_uri`.
+    #[must_use]
+    pub fn hyperlink_id(&self) -> u32 {
+        self.attrs.link
+    }
+
     /// Returns whether the cell should be rendered with the bold text
     /// attribute.
     #[must_use]
@@ -168,6 +179,20 @@ impl Cell {
     #[must_use]
     pub fn underline(&self) -> bool {
         self.attrs.underline()
+    }
+
+    /// Returns the extended underline style the cell should be rendered with
+    /// (single, double, curly, dotted or dashed).
+    #[must_use]
+    pub fn underline_style(&self) -> crate::attrs::UnderlineStyle {
+        self.attrs.underline_style()
+    }
+
+    /// Returns the underline colour (SGR 58) the cell should be rendered
+    /// with.  `Color::Default` means "use the foreground colour".
+    #[must_use]
+    pub fn underline_color(&self) -> crate::Color {
+        self.attrs.ulcolor()
     }
 
     /// Returns whether the cell should be rendered with the inverse text

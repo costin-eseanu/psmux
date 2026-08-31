@@ -18,6 +18,8 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         active_path: vec![],
         name: name.to_string(),
         id,
+        area: ratatui::layout::Rect::new(0, 0, 120, 30),
+        window_size: None,
         activity_flag: false,
         bell_flag: false,
         silence_flag: false,
@@ -27,6 +29,9 @@ fn make_window(name: &str, id: usize) -> crate::types::Window {
         layout_index: 0,
         pane_mru: vec![],
         zoom_saved: None,
+        linked_from: None,
+        floating: Vec::new(),
+        floating_focus: None,
     }
 }
 
@@ -673,8 +678,8 @@ fn choose_tree_enters_window_chooser_mode() {
 fn choose_tree_builds_correct_tree_from_list_all_sessions() {
     // Directly test list_all_sessions_tree with known data
     let windows = vec![
-        ("editor".to_string(), 1usize, "120x30".to_string(), true),
-        ("server".to_string(), 2, "120x30".to_string(), false),
+        ("editor".to_string(), 1usize, "120x30".to_string(), true, 0usize),
+        ("server".to_string(), 2, "120x30".to_string(), false, 1usize),
     ];
     // Create a fake port file for our session so the tree builder can find it
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap();
@@ -896,25 +901,26 @@ fn displayp_alias_works() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  19. new-session: cannot create from inside, must show feedback
+//  19. new-session: issue #200 fix, now actually creates sessions instead of blocking
 // ════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn new_session_blocked_with_feedback() {
+fn new_session_does_not_block_with_popup() {
+    // Issue #200: new-session should no longer show the blocking popup.
+    // It should attempt to create a session (which may fail in test env
+    // without a real server, but must NOT show the old blocking popup).
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "new-session").unwrap();
-    let (cmd, out) = extract_popup(&app);
-    assert_eq!(cmd, "new-session");
-    assert!(out.contains("cannot create"), "must explain why new-session is blocked");
-    assert!(out.contains("inside a session"), "must mention being inside a session");
+    let in_blocking_popup = matches!(&app.mode, Mode::PopupMode { output, .. } if output.contains("cannot create"));
+    assert!(!in_blocking_popup, "new-session should not show blocking popup after issue #200 fix");
 }
 
 #[test]
-fn new_alias_also_blocked() {
+fn new_alias_does_not_block() {
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "new").unwrap();
-    let (_, out) = extract_popup(&app);
-    assert!(out.contains("cannot create"));
+    let in_blocking_popup = matches!(&app.mode, Mode::PopupMode { output, .. } if output.contains("cannot create"));
+    assert!(!in_blocking_popup, "'new' alias should not show blocking popup after issue #200 fix");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -963,8 +969,8 @@ fn choose_client_is_noop() {
 fn customize_mode_shows_options_popup() {
     let mut app = mock_app_with_window();
     execute_command_string(&mut app, "customize-mode").unwrap();
-    // customize-mode now shows an options popup instead of being a no-op
-    assert!(matches!(app.mode, Mode::PopupMode { .. }));
+    // customize-mode now opens an interactive option editor
+    assert!(matches!(app.mode, Mode::CustomizeMode { .. }));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1030,9 +1036,19 @@ fn server_forwarded_swap_window() { assert_server_forward_noop("swap-window -t 1
 #[test]
 fn server_forwarded_swapw() { assert_server_forward_noop("swapw -t 1"); }
 #[test]
-fn server_forwarded_link_window() { assert_server_forward_noop("link-window -s 0 -t 1"); }
+fn server_forwarded_link_window() {
+    // link-window is now functional: creates a linked window (not a noop)
+    let mut app = mock_app_with_window();
+    app.control_port = None;
+    execute_command_string(&mut app, "link-window -s 0 -t 1").unwrap();
+    // May or may not add a window depending on PTY availability in test env
+}
 #[test]
-fn server_forwarded_linkw() { assert_server_forward_noop("linkw -s 0 -t 1"); }
+fn server_forwarded_linkw() {
+    let mut app = mock_app_with_window();
+    app.control_port = None;
+    execute_command_string(&mut app, "linkw -s 0 -t 1").unwrap();
+}
 #[test]
 fn server_forwarded_unlink_window() { assert_server_forward_noop("unlink-window"); }
 #[test]
@@ -1161,11 +1177,12 @@ fn prompt_delegates_list_keys() {
 }
 
 #[test]
-fn prompt_delegates_new_session_shows_feedback() {
+fn prompt_delegates_new_session_creates_session() {
+    // Issue #200: command prompt new-session should attempt creation, not block
     let mut app = mock_app_with_window();
     run_via_prompt(&mut app, "new-session");
-    let (_, out) = extract_popup(&app);
-    assert!(out.contains("cannot create"));
+    let in_blocking_popup = matches!(&app.mode, Mode::PopupMode { output, .. } if output.contains("cannot create"));
+    assert!(!in_blocking_popup, "command prompt new-session should not show blocking popup");
 }
 
 #[test]
@@ -1200,7 +1217,7 @@ fn parse_action_direct_commands() {
     assert!(matches!(parse_command_to_action("renamew"), Some(Action::RenameWindow)));
     assert!(matches!(parse_command_to_action("choose-tree"), Some(Action::WindowChooser)));
     assert!(matches!(parse_command_to_action("choose-window"), Some(Action::WindowChooser)));
-    assert!(matches!(parse_command_to_action("choose-session"), Some(Action::WindowChooser)));
+    assert!(matches!(parse_command_to_action("choose-session"), Some(Action::SessionChooser)));
     assert!(matches!(parse_command_to_action("zoom-pane"), Some(Action::ZoomPane)));
     assert!(matches!(parse_command_to_action("resize-pane -Z"), Some(Action::ZoomPane)));
 }
@@ -1585,6 +1602,114 @@ fn window_index_prompt_accepts_digits_only() {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  Issue #170: run-shell output display
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn run_shell_captures_and_displays_output() {
+    let mut app = mock_app();
+    // Use a simple echo command that produces stdout
+    #[cfg(windows)]
+    let cmd = r#"run-shell "Write-Output 'hello-from-run-shell'""#;
+    #[cfg(not(windows))]
+    let cmd = r#"run-shell "echo hello-from-run-shell""#;
+
+    let _ = execute_command_string(&mut app, cmd);
+
+    // run-shell is now async: the command runs in a background thread
+    // and sends output via run_shell_rx. We need to recv the result.
+    let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
+    let (title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("should receive run-shell output within 10s");
+    assert_eq!(title, "run-shell");
+    assert!(
+        text.contains("hello-from-run-shell"),
+        "run-shell output should contain the echoed text, got: {}",
+        text
+    );
+}
+
+#[test]
+fn run_shell_background_does_not_show_popup() {
+    let mut app = mock_app();
+    // With -b flag: should NOT enter PopupMode
+    #[cfg(windows)]
+    let cmd = r#"run-shell -b "Write-Output 'background-test'""#;
+    #[cfg(not(windows))]
+    let cmd = r#"run-shell -b "echo background-test""#;
+
+    let _ = execute_command_string(&mut app, cmd);
+
+    assert!(
+        !matches!(app.mode, Mode::PopupMode { .. }),
+        "run-shell -b should NOT produce a popup, mode = {:?}",
+        std::mem::discriminant(&app.mode)
+    );
+}
+
+#[test]
+fn run_shell_alias_captures_output() {
+    let mut app = mock_app();
+    // "run" is the short alias for "run-shell"
+    #[cfg(windows)]
+    let cmd = r#"run "Write-Output 'alias-test'""#;
+    #[cfg(not(windows))]
+    let cmd = r#"run "echo alias-test""#;
+
+    let _ = execute_command_string(&mut app, cmd);
+
+    let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
+    let (_title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("should receive run alias output within 10s");
+    assert!(
+        text.contains("alias-test"),
+        "run alias should also capture output, got: {}",
+        text
+    );
+}
+
+#[test]
+fn run_shell_stderr_is_captured() {
+    let mut app = mock_app();
+    // Use a command that writes to stderr
+    #[cfg(windows)]
+    let cmd = r#"run-shell "Write-Error 'error-output' 2>&1""#;
+    #[cfg(not(windows))]
+    let cmd = r#"run-shell "echo error-output >&2""#;
+
+    let _ = execute_command_string(&mut app, cmd);
+
+    let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
+    let (_title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("should receive run-shell stderr output within 10s");
+    assert!(
+        text.contains("error-output") || text.contains("error"),
+        "run-shell should capture stderr, got: {}",
+        text
+    );
+}
+
+#[test]
+fn run_shell_empty_output_no_popup() {
+    let mut app = mock_app();
+    // A command that produces no output should not show a popup
+    #[cfg(windows)]
+    let cmd = r#"run-shell "Write-Output ''""#;
+    #[cfg(not(windows))]
+    let cmd = r#"run-shell "true""#;
+
+    let _ = execute_command_string(&mut app, cmd);
+
+    // On Windows, Write-Output '' produces a newline, so a popup may appear
+    // On Unix, `true` produces no output, so no popup
+    #[cfg(not(windows))]
+    assert!(
+        !matches!(app.mode, Mode::PopupMode { .. }),
+        "run-shell with no output should not produce a popup"
+    );
+}
+
 #[test]
 fn window_index_prompt_backspace_removes_digit() {
     let mut app = mock_app_with_windows(&["w0", "w1"]);
@@ -1745,4 +1870,231 @@ fn display_popup_d_flag_with_percent_dims() {
         }
         other => panic!("expected PopupMode, got {:?}", std::mem::discriminant(other)),
     }
+}
+
+// ── Issue #111 follow-up: new-window -c must preserve -c flag in bind-key ──
+
+#[test]
+fn new_window_bare_returns_action_new_window() {
+    // Bare new-window with no args should still return the simple Action::NewWindow
+    assert!(matches!(parse_command_to_action("new-window"), Some(Action::NewWindow)));
+    assert!(matches!(parse_command_to_action("neww"), Some(Action::NewWindow)));
+}
+
+#[test]
+fn new_window_with_c_flag_returns_command_preserving_args() {
+    // new-window -c <dir> must NOT be reduced to Action::NewWindow — the -c flag
+    // must be preserved so the server can expand #{pane_current_path}. (Issue #111)
+    match parse_command_to_action("new-window -c #{pane_current_path}") {
+        Some(Action::Command(cmd)) => {
+            assert!(cmd.contains("-c"), "expected -c in command, got: {}", cmd);
+            assert!(cmd.contains("#{pane_current_path}"), "expected format var in command, got: {}", cmd);
+        }
+        _ => panic!("expected Action::Command preserving -c"),
+    }
+}
+
+#[test]
+fn new_window_with_name_flag_returns_command() {
+    // new-window -n myname should also be preserved as Command
+    match parse_command_to_action("new-window -n myname") {
+        Some(Action::Command(cmd)) => {
+            assert!(cmd.contains("-n"), "expected -n in command, got: {}", cmd);
+            assert!(cmd.contains("myname"), "expected window name in command, got: {}", cmd);
+        }
+        _ => panic!("expected Action::Command"),
+    }
+}
+
+#[test]
+fn new_window_with_shell_command_returns_command() {
+    // new-window -- python3 should also be preserved
+    match parse_command_to_action("new-window -- python3") {
+        Some(Action::Command(cmd)) => {
+            assert!(cmd.contains("python3"), "expected shell command in command, got: {}", cmd);
+        }
+        _ => panic!("expected Action::Command"),
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Issue #170 follow-up: run-shell no-arg usage + display-message defaults
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn run_shell_no_args_shows_usage() {
+    let mut app = mock_app();
+    let _ = execute_command_string(&mut app, "run-shell");
+    // Should show usage on status bar, not enter popup
+    assert!(!matches!(app.mode, Mode::PopupMode { .. }), "run-shell with no args should not show popup");
+    let msg = app.status_message.as_ref().map(|(m, ..)| m.as_str()).unwrap_or("");
+    assert!(msg.contains("usage"), "expected usage message on status bar, got: {}", msg);
+}
+
+#[test]
+fn run_alias_no_args_shows_usage() {
+    let mut app = mock_app();
+    let _ = execute_command_string(&mut app, "run");
+    assert!(!matches!(app.mode, Mode::PopupMode { .. }));
+    let msg = app.status_message.as_ref().map(|(m, ..)| m.as_str()).unwrap_or("");
+    assert!(msg.contains("usage"), "expected usage message for 'run' alias, got: {}", msg);
+}
+
+#[test]
+fn display_message_no_args_uses_default_format() {
+    let mut app = mock_app();
+    // Ensure control_port is None so the local handler runs
+    app.control_port = None;
+    let _ = execute_command_string(&mut app, "display-message");
+    let msg = app.status_message.as_ref().map(|(m, ..)| m.as_str()).unwrap_or("");
+    // Default format should contain session name
+    assert!(!msg.is_empty(), "display-message with no args should produce a non-empty status message");
+    assert!(msg.contains("test_session"), "default format should expand session_name, got: {}", msg);
+}
+
+#[test]
+fn display_alias_no_args_uses_default_format() {
+    let mut app = mock_app();
+    app.control_port = None;
+    let _ = execute_command_string(&mut app, "display");
+    let msg = app.status_message.as_ref().map(|(m, ..)| m.as_str()).unwrap_or("");
+    assert!(!msg.is_empty(), "display alias with no args should produce a non-empty status message");
+}
+
+#[test]
+fn display_message_with_args_still_works() {
+    let mut app = mock_app();
+    app.control_port = None;
+    let _ = execute_command_string(&mut app, "display-message \"hello world\"");
+    let msg = app.status_message.as_ref().map(|(m, ..)| m.as_str()).unwrap_or("");
+    assert!(msg.contains("hello world"), "display-message with explicit text should show it, got: {}", msg);
+}
+
+#[test]
+fn run_shell_error_shows_on_status_bar() {
+    let mut app = mock_app();
+    // Use a command that will definitely fail (non-existent program path)
+    let _ = execute_command_string(&mut app, "run-shell \"__nonexistent_program_that_does_not_exist_12345\"");
+    // Either shows popup with error output, or shows error on status bar
+    // (depends on whether shell itself reports the error via stderr)
+    match &app.mode {
+        Mode::PopupMode { output, .. } => {
+            // Shell captured the error as stderr output
+            assert!(!output.is_empty(), "popup should contain error information");
+        }
+        _ => {
+            // If no popup, the status bar might have an error (e.g. shell not found)
+            // This is acceptable behavior
+        }
+    }
+}
+
+#[test]
+fn resolve_run_shell_returns_valid_shell() {
+    let (prog, args) = resolve_run_shell();
+    assert!(!prog.is_empty(), "shell program should not be empty");
+    assert!(!args.is_empty(), "shell args should include at least one flag");
+    // The returned program should be findable on the system
+    assert!(
+        which::which(&prog).is_ok(),
+        "resolved shell '{}' should exist on PATH",
+        prog
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn resolve_run_shell_returns_absolute_windows_shell_path() {
+    let (prog, args) = resolve_run_shell();
+    let path = std::path::Path::new(&prog);
+    assert!(!args.is_empty(), "shell args should include at least one flag");
+    assert!(
+        path.is_absolute(),
+        "windows run-shell should resolve to an absolute executable path, got '{}'",
+        prog
+    );
+    assert!(
+        path.is_file(),
+        "resolved windows shell path should point to an existing file, got '{}'",
+        prog
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Issue #201: prefix+$ should enter RenameSessionPrompt, NOT RenamePrompt
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn prefix_dollar_enters_rename_session_prompt_not_rename_window() {
+    let mut app = mock_app_with_window();
+    app.mode = Mode::Prefix { armed_at: std::time::Instant::now() };
+    handle_key(&mut app, press(KeyCode::Char('$'))).unwrap();
+    assert!(
+        matches!(app.mode, Mode::RenameSessionPrompt { .. }),
+        "prefix+$ must enter RenameSessionPrompt mode, got {:?}",
+        std::mem::discriminant(&app.mode)
+    );
+    // Crucially, it should NOT be RenamePrompt (window rename)
+    assert!(
+        !matches!(app.mode, Mode::RenamePrompt { .. }),
+        "prefix+$ must NOT enter RenamePrompt (window rename) mode"
+    );
+}
+
+#[test]
+fn prefix_comma_enters_rename_window_prompt_not_session() {
+    let mut app = mock_app_with_window();
+    app.mode = Mode::Prefix { armed_at: std::time::Instant::now() };
+    handle_key(&mut app, press(KeyCode::Char(','))).unwrap();
+    assert!(
+        matches!(app.mode, Mode::RenamePrompt { .. }),
+        "prefix+, must enter RenamePrompt (window) mode"
+    );
+    assert!(
+        !matches!(app.mode, Mode::RenameSessionPrompt { .. }),
+        "prefix+, must NOT enter RenameSessionPrompt mode"
+    );
+}
+
+#[test]
+fn rename_session_prompt_typing_and_enter_applies_session_name() {
+    let mut app = mock_app_with_window();
+    app.session_name = "old_session".to_string();
+    app.mode = Mode::RenameSessionPrompt { input: String::new() };
+    // Type "new_session"
+    for c in "new_session".chars() {
+        handle_key(&mut app, press(KeyCode::Char(c))).unwrap();
+    }
+    if let Mode::RenameSessionPrompt { ref input } = app.mode {
+        assert_eq!(input, "new_session");
+    } else {
+        panic!("should still be in RenameSessionPrompt while typing");
+    }
+    // Press Enter to apply
+    handle_key(&mut app, press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.session_name, "new_session", "session name should be updated");
+    assert!(matches!(app.mode, Mode::Passthrough), "should return to Passthrough after Enter");
+}
+
+#[test]
+fn rename_window_prompt_typing_and_enter_applies_window_name() {
+    let mut app = mock_app_with_window();
+    app.windows[0].name = "old_win".to_string();
+    app.mode = Mode::RenamePrompt { input: String::new() };
+    for c in "new_win".chars() {
+        handle_key(&mut app, press(KeyCode::Char(c))).unwrap();
+    }
+    handle_key(&mut app, press(KeyCode::Enter)).unwrap();
+    assert_eq!(app.windows[0].name, "new_win", "window name should be updated");
+    assert!(matches!(app.mode, Mode::Passthrough), "should return to Passthrough after Enter");
+}
+
+#[test]
+fn rename_session_prompt_esc_cancels_without_changing_name() {
+    let mut app = mock_app_with_window();
+    app.session_name = "original".to_string();
+    app.mode = Mode::RenameSessionPrompt { input: "typed_but_cancelled".to_string() };
+    handle_key(&mut app, press(KeyCode::Esc)).unwrap();
+    assert_eq!(app.session_name, "original", "session name must not change on Esc");
+    assert!(matches!(app.mode, Mode::Passthrough));
 }

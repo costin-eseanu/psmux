@@ -65,6 +65,7 @@ temp_cmd.txt
 *fix_results*.txt
 *_results.txt
 *test_*.txt
+*tmp_*.txt
 
 # Database files
 *.db
@@ -85,8 +86,11 @@ release/
 
 # Gas Town (added by gt)
 .runtime/
-.claude/
 .logs/
 __pycache__/
 state.json
 CLAUDE.md
+
+# OMC / Claude tooling state (not part of the project)
+.omc/
+.claude/
